@@ -1,0 +1,23 @@
+[Unit]
+Description=Passive HDD activity and telemetry monitor
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/disk-monitor --config /etc/disk-monitor/config.toml run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+KillMode=control-group
+RuntimeDirectory=disk-monitor
+RuntimeDirectoryMode=0755
+UMask=0022
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/disk-monitor
+# Raw ATA ioctls require root and device access. PrivateDevices would hide disks.
+
+[Install]
+WantedBy=multi-user.target
