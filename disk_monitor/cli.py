@@ -35,7 +35,7 @@ def main(argv=None):
             with config.output.open() as stream:
                 document = with_freshness(json.load(stream))
             print(json.dumps(document, indent=2))
-            return 0 if document["service_fresh"] else 1
+            return 0
         else:
             stop = threading.Event()
             for signum in (signal.SIGINT, signal.SIGTERM):

@@ -56,10 +56,16 @@ The installer does not install Python development tools or Python packages.
 ## Configure and run
 
 Start with [config/example.toml](config/example.toml). Configure each drive's
-actual serial and optional unique bay label. Intervals accept finite numbers
+actual serial and optional unique positive integer bay number (for example,
+`bay = 1` through `bay = 6`). Bays are configured slots, never `/dev/sdX` order.
+Omit bay for an unnumbered installation. Intervals accept finite numbers
 from 1 to 86400 seconds; omitted intervals use the defaults above. Unknown keys,
-duplicate identities/aliases, duplicate bay labels and malformed values fail
-validation. Configuration is loaded once; restart after changing it.
+duplicate identities/aliases, duplicate bay numbers and malformed values fail
+validation. `discovery_interval` defaults to 60 seconds and accepts the same
+range. Discovery runs at startup and reconciles periodically; command-boundary
+identity checks remain. Ordinary unplug/replug or enclosure power cycles recover
+automatically, normally within 60 seconds, with no service restart. Configuration
+is loaded once; restart after changing it.
 
 ```sh
 # Source checkout or installed CLI; discovery reads cached metadata only.
@@ -80,21 +86,35 @@ multiple matches, or two configured drives claiming one device, are ambiguous.
 An unexpected replacement serial stays missing rather than inheriting a bay.
 
 `status` reads the JSON only, recalculates freshness and exits 1 for a missing,
-malformed, unsupported or stale service document. A live service with unknown
-observations still exits 0: inspect each observation, not only the exit code.
+malformed or unsupported document. A valid snapshot exits 0 even if its
+observations are unknown or stale: inspect each observation and its timestamps.
+This command does not assert service liveness; use `systemctl is-active` for that.
 `validate` exits 0 for valid configuration and 1 on errors. Argument errors exit 2.
 Do not run foreground monitoring alongside the systemd service. A lifetime
 output-file lock rejects a second writer using the same path.
 
 ## State and troubleshooting
 
-Default output: `/run/disk-monitor/state.json`, schema version 1. Atomic rename
+Default output: `/run/disk-monitor/state.json`, schema version 2. Atomic rename
 ensures readers see one complete document. Files are mode 0644; serials and bay
-labels are visible to local users. There is no persistent telemetry history.
+numbers are visible to local users. There is no persistent telemetry history.
+Runtime state is authoritative in memory. Startup, presence/identity changes,
+completed hardware probes (including failures), and I/O busy/idle/unknown
+transitions publish snapshots; changes in one scheduler iteration coalesce.
+There is no heartbeat. Repeated I/O samples update memory without writes; other
+events include the latest I/O sample. An unchanged classification can therefore
+be stale in the file even while the monitor is running.
+
 Each observation has independent attempt/success timestamps, source, error,
 maximum age and freshness. Cached last successful temperatures are retained
 through a failed/standby probe, without being presented as a fresh measurement.
-See the [schema and design](docs/design.md) for exact consumer rules.
+Drive-level `last_active_at` retains the latest trustworthy spinning evidence
+through standby, idle and temporary absence for the same serial. It resets to
+null on service restart and never transfers to another serial in the same bay.
+It is not a spin-down timestamp. An internal bounded completion mailbox provides
+full snapshots for future consumers, including a temperature snapshot after every
+completed temperature attempt; no bridge transport is implemented. See the
+[schema and design](docs/design.md) for exact evidence and consumer rules.
 
 - `journalctl -u disk-monitor.service` reports fatal configuration/publication
   failures; per-probe failures appear in JSON `error` fields.
@@ -111,8 +131,9 @@ See the [schema and design](docs/design.md) for exact consumer rules.
   as `active`, matching NAS semantics; failed or malformed output is `unknown`.
 - `baseline_required` is expected on startup, reconnect, counter reset or a
   polling gap. A 0% busy observation never authorizes standby.
-- Stale service heartbeat: check service state and output permissions. Consumers
-  must expire data themselves even if the file still says `fresh: true`.
+- Stale observations: check their individual timestamps, service state and output
+  permissions. Consumers must expire data themselves even if the file still says
+  `fresh: true`; file modification time does not indicate service liveness.
 
 ## Development
 

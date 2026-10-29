@@ -1,3 +1,5 @@
+discovery_interval = 60
+
 [intervals]
 io = 10
 spindle = 30
@@ -9,7 +11,7 @@ path = "/run/disk-monitor/state.json"
 
 [[drives]]
 serial = "REPLACE_WITH_DRIVE_SERIAL"
-bay = "hdd1"
+bay = 1
 # Exact cached identity or full by-id basename, verified manually for this drive.
 # Never use a bridge-wide shared serial. No substring/fuzzy matching is performed.
 # identity_aliases = ["ata-MODEL_DRIVE_SERIAL"]

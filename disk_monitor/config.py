@@ -12,7 +12,7 @@ DEFAULTS = {"io": 10, "spindle": 30, "temperature": 60, "self_test": 60}
 @dataclass(frozen=True)
 class Drive:
     serial: str
-    bay: str | None = None
+    bay: int | None = None
     identity_aliases: tuple[str, ...] = ()
 
 
@@ -21,6 +21,7 @@ class Config:
     drives: tuple[Drive, ...]
     intervals: dict
     output: Path = Path("/run/disk-monitor/state.json")
+    discovery_interval: float = 60
 
 
 def keys(value, allowed):
@@ -39,7 +40,7 @@ def identity(value):
 def load(path):
     with Path(path).open("rb") as stream:
         data = tomllib.load(stream)
-    keys(data, ("drives", "intervals", "output"))
+    keys(data, ("drives", "intervals", "output", "discovery_interval"))
     intervals = dict(DEFAULTS)
     supplied = data.get("intervals", {})
     keys(supplied, DEFAULTS)
@@ -51,6 +52,13 @@ def load(path):
         ):
             raise ValueError(f"{name} interval must be 1..86400 seconds")
         intervals[name] = value
+    discovery_interval = data.get("discovery_interval", 60)
+    if (
+        type(discovery_interval) not in (int, float)
+        or not math.isfinite(discovery_interval)
+        or not 1 <= discovery_interval <= 86400
+    ):
+        raise ValueError("discovery_interval must be 1..86400 seconds")
     rows = data.get("drives")
     if not isinstance(rows, list) or not 1 <= len(rows) <= 32:
         raise ValueError("configure 1..32 drives")
@@ -58,7 +66,9 @@ def load(path):
     for row in rows:
         keys(row, ("serial", "bay", "identity_aliases"))
         serial = identity(row.get("serial"))
-        bay = identity(row["bay"]) if "bay" in row else None
+        bay = row.get("bay")
+        if "bay" in row and (type(bay) is not int or bay < 1):
+            raise ValueError("bay must be a positive integer")
         aliases = row.get("identity_aliases", [])
         if not isinstance(aliases, list):
             raise ValueError("identity_aliases must be an array")
@@ -81,4 +91,4 @@ def load(path):
         or ".." in Path(path).parts
     ):
         raise ValueError("output.path must be an absolute safe path")
-    return Config(tuple(drives), intervals, Path(path))
+    return Config(tuple(drives), intervals, Path(path), discovery_interval)

@@ -28,6 +28,7 @@ def discover(
         if not re.fullmatch(r"sd[a-z]+", entry.name):
             continue
         try:
+            location = str(entry.resolve())
             dev = (entry / "dev").read_text().strip()
             seq = (entry / "diskseq").read_text().strip()
             if not re.fullmatch(r"\d+:\d+", dev) or not seq.isdecimal():
@@ -58,11 +59,17 @@ def discover(
                     links.append(link.name)
                     # Exact full by-id basename is an opt-in alias, never substring matching.
                     identities.add(link.name)
+            if (
+                (entry / "diskseq").read_text().strip() != seq
+                or (entry / "dev").read_text().strip() != dev
+                or str(entry.resolve()) != location
+            ):
+                raise OSError("device changed during discovery")
             devices.append(
                 Device(
                     entry.name,
                     frozenset(identities),
-                    (str(entry.resolve()), dev, seq),
+                    (location, dev, seq),
                     tuple(sorted(links)),
                 )
             )
@@ -94,3 +101,16 @@ def resolve(drives, devices):
         else:
             result[drive.serial] = ("present", found[0])
     return result
+
+
+def same_generation(device, sys_block=Path("/sys/block")):
+    """Cheap kernel-only guard around counter reads."""
+    entry = sys_block / device.name
+    try:
+        return device.generation == (
+            str(entry.resolve()),
+            (entry / "dev").read_text().strip(),
+            (entry / "diskseq").read_text().strip(),
+        )
+    except (OSError, UnicodeError):
+        return False

@@ -35,8 +35,9 @@ sanitized outcome in this repository; keep raw system exports and secrets out.
    monitor must neither start nor abort the test. Do not generate extra tests or
    waking work just to satisfy the checklist without approval.
 4. **I/O comparison:** during the same workload, compare actual `stat` deltas,
-   elapsed time and reported window/busy percentage; cross-check `iostat -x` if
-   available. Internal SMART work need not produce host I/O utilization.
+   elapsed time and reported window/busy percentage; verify busy/idle transitions
+   publish but repeated same-classification I/O samples do not; cross-check
+   `iostat -x` if available. Internal SMART work need not produce host I/O utilization.
 5. **Supervised foreground run:** use a separate tmpfs output; verify all four
    cadences over at least 15 minutes and sleeping media remain asleep. Arrange
    the NAS maintenance/lifecycle exclusion strategy first; do not concurrently
@@ -45,12 +46,15 @@ sanitized outcome in this repository; keep raw system exports and secrets out.
 6. **Recovery:** only with unmounted/test media or an operator-approved safe
    enclosure-off transition, disconnect/reconnect and check unknown/missing,
    new diskseq, discarded in-flight samples, clean baselines, reordered paths,
-   and no temperature transfer to a replacement disk. Never unplug mounted disks
+   preservation of last_active_at for the same serial within the process,
+   detection within the 60-second discovery interval, and no history or
+   temperature transfer to a replacement serial. Never unplug mounted disks
    for this test. If a safe replacement/duplicate-ID fixture is unavailable,
    record that physical case untested; keep the software tests as separate evidence.
 7. **Lifecycle/publication:** terminate/restart foreground, then test the systemd
-   unit in the approved window. Verify clean bounded exit, stale heartbeat after
-   stop, atomic readable JSON, cleared evidence on restart, and a rejected second
+   unit in the approved window. Verify clean bounded exit, individual measurement
+   expiry after stop without heartbeat writes, atomic readable JSON, cleared
+   evidence (including last_active_at) on restart, and a rejected second
    writer. Check `systemd-analyze verify` on the installed target unit and audit
    file ownership/modes, output tmpfs, service permissions and restart logs.
 

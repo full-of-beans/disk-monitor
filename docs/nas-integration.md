@@ -30,22 +30,22 @@ with top-level integer `observed_at` and `disks` keyed by serial. Rows include:
 `nas-hdd-status` reads cached idle and temperature; `nas_storage.observability`
 reads identity, presence/power/idle and temperature for API/Cockpit projections.
 The publisher also accepts SSD temperature captures and immediate verified
-standby transitions from NAS operations. Thus sharing the numeric schema version
-1 does **not** make this service's document compatible. Do not simply point its
-output at the old filename or run both publishers on that file.
+standby transitions from NAS operations. This service's schema-2 document is
+**not** compatible. Do not simply point its output at the old filename or run
+both publishers on that file.
 
 Before replacement, the NAS integration PR must either migrate all consumers
 atomically to the native schema or implement a NAS-owned projection with:
 
 1. Exact serial-to-role mapping from authoritative inventory; bay is only a
-   display label. Preserve SSD observations through their NAS-owned path because
-   this release observes ATA HDDs only.
+   configured numeric physical slot. Preserve SSD observations through their
+   NAS-owned path because this release observes ATA HDDs only.
 2. Independent success times for presence, power and temperature. Floor positive
    epoch seconds to integer only for old consumers. Never use publication time
    as measurement time. Unknown/stale power stays unknown; retained temperature
    preserves its actual original time and is never refreshed by a spindle poll.
-3. Explicit consumer-side heartbeat and per-kind expiry, future-clock rejection,
-   no cached standby evidence used to authorize enclosure power removal.
+3. Explicit per-kind expiry and separate service-health checks, future-clock
+   rejection, no cached standby evidence used to authorize enclosure power removal.
 4. NAS-owned idle_seconds or null, with original continuous-counter and gap/reset
    protections. A rounded 0% utilization cannot supply this field.
 5. A single writer for any legacy projection. Coordinate NAS verified-standby and

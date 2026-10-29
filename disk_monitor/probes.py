@@ -74,9 +74,8 @@ def io_counter(device, sys_block=Path("/sys/block")):
     )
     if len(fields) < 11 or any(f < 0 for f in fields):
         raise ValueError("invalid_io_counters")
-    return fields[
-        9
-    ]  # milliseconds with at least one I/O in progress, not weighted time
+    # Keep request/sector counters too: short real I/O may add no io_ticks.
+    return fields[9], fields[:8] + fields[11:15]
 
 
 def observe(kind, device, runner=run):
@@ -95,9 +94,19 @@ def observe(kind, device, runner=run):
             else ["-c", "--json"]
         )
         doc = smart_document(runner(args + [device.path], 3))
+        # If firmware supplies identity despite the narrow query, reject a
+        # contradiction rather than accepting telemetry for another drive.
+        if "serial_number" in doc and doc["serial_number"] not in device.identities:
+            return None, "identity_changed", {}
         # No -i: activity is read from capabilities, not a historical test log.
         value = temperature(doc) if kind == "temperature" else self_test(doc)
-        return value, None, {}
+        # Current running-test status is activity evidence; a temperature or
+        # historical/inactive test value alone may be cached and is not.
+        return (
+            value,
+            None,
+            {"confirms_active": kind == "self_test" and value == "active"},
+        )
     except ValueError as error:
         reason = str(error)
         if reason not in {

@@ -21,7 +21,7 @@ class Configuration(unittest.TestCase):
     def test_example(self):
         cfg = config.load("config/example.toml")
         self.assertEqual(cfg.intervals, config.DEFAULTS)
-        self.assertEqual(cfg.drives[0].bay, "hdd1")
+        self.assertEqual(cfg.drives[0].bay, 1)
 
     def test_validation(self):
         base = '[[drives]]\nserial="S"\n'
@@ -112,11 +112,14 @@ class Discovery(unittest.TestCase):
     def test_generation_changes_and_unreadable_metadata(self):
         path = self.disk()
         first = self.scan()[0]
+        self.assertTrue(discovery.same_generation(first, self.sys))
         (path / "diskseq").write_text("2")
+        self.assertFalse(discovery.same_generation(first, self.sys))
         self.assertNotEqual(first, self.scan()[0])
         (path / "device/serial").unlink()
         self.assertEqual(self.scan()[0].identities, frozenset())
         (path / "diskseq").unlink()
+        self.assertFalse(discovery.same_generation(first, self.sys))
         with self.assertRaises(OSError):
             self.scan()
         (path / "diskseq").write_text("2")
@@ -200,6 +203,7 @@ class Probes(unittest.TestCase):
             '{"ata_smart_data":{"self_test":{"status":{"value":240}}}}'
         )
         self.assertEqual(probes.observe("self_test", disk, runner)[0], "active")
+        self.assertTrue(probes.observe("self_test", disk, runner)[2]["confirms_active"])
         self.assertNotIn("-i", runner.call_args.args[0])
         self.assertIn("-c", runner.call_args.args[0])
         for failure in (
@@ -222,7 +226,7 @@ class Probes(unittest.TestCase):
             path = root / "sda/stat"
             disk = discovery.Device("sda", frozenset(), ("p", "8:0", "1"))
             path.write_text("1 2 3 4 5 6 7 8 9 123 999")
-            self.assertEqual(probes.io_counter(disk, root), 123)
+            self.assertEqual(probes.io_counter(disk, root), (123, tuple(range(1, 9))))
             for text in ("1 2", "x", "1 2 3 4 5 6 7 8 9 -1 0"):
                 path.write_text(text)
                 with self.assertRaises(ValueError):
@@ -236,12 +240,13 @@ class Polling(unittest.TestCase):
         self.visible = [self.disk]
         self.counter = 0
         self.probe = Mock(return_value=("active", None, {}))
-        self.cfg = config.Config((config.Drive("S", "hdd1"),), dict(config.DEFAULTS))
+        self.cfg = config.Config((config.Drive("S", 1),), dict(config.DEFAULTS))
         self.monitor = service.Monitor(
             self.cfg,
             discoverer=lambda: self.visible,
             probe=self.probe,
-            counter=lambda _: self.counter,
+            counter=lambda _: (self.counter, (self.counter,)),
+            validator=lambda d: d in self.visible,
             clock=lambda: self.now,
             epoch=lambda: self.now,
         )
@@ -303,9 +308,11 @@ class Polling(unittest.TestCase):
         self.monitor.tick()
         self.assertTrue(started.wait(1))
         self.visible = []
+        self.now += 60
         row = self.monitor.tick()["disks"]["S"]
         self.assertIn(row["presence"], ("missing", "unknown"))
         self.visible = [discovery.Device("sda", frozenset(("S",)), ("p", "8:0", "2"))]
+        self.now += 60
         self.monitor.tick()
         release.set()
         row = self.settle()
@@ -328,12 +335,14 @@ class Polling(unittest.TestCase):
         self.counter = 1000
         self.monitor.tick()
         self.visible = [discovery.Device("sdb", frozenset(("S",)), ("q", "8:16", "2"))]
+        self.now += 60
         row = self.monitor.tick()["disks"]["S"]
         self.assertEqual(row["device"], "/dev/sdb")
         self.assertIsNone(row["observations"]["io"]["value"])
         self.visible = [
             discovery.Device("sdb", frozenset(("replacement",)), ("q", "8:16", "3"))
         ]
+        self.now += 60
         row = self.monitor.tick()["disks"]["S"]
         self.assertEqual(row["presence"], "missing")
         self.assertIsNone(row["observations"]["temperature"]["last_success_at"])
@@ -354,7 +363,8 @@ class Polling(unittest.TestCase):
             cfg,
             discoverer=lambda: [self.disk, other],
             probe=probe,
-            counter=lambda _: 0,
+            counter=lambda _: (0, (0,)),
+            validator=lambda d: True,
             clock=lambda: self.now,
             epoch=lambda: self.now,
         )
@@ -389,7 +399,7 @@ class Polling(unittest.TestCase):
 class PublicationAndCLI(unittest.TestCase):
     def test_atomic_permissions_failure_cleanup_and_freshness(self):
         doc = {
-            "schema_version": 1,
+            "schema_version": state.SCHEMA_VERSION,
             "published_at": 100,
             "disks": {
                 "S": {
@@ -417,8 +427,12 @@ class PublicationAndCLI(unittest.TestCase):
                     "fresh"
                 ]
             )
-            for now in (90, 106, 200):
-                self.assertFalse(state.with_freshness(doc, now)["service_fresh"])
+            for now, fresh in ((90, False), (106, True), (200, False)):
+                refreshed = state.with_freshness(doc, now)
+                self.assertNotIn("service_fresh", refreshed)
+                self.assertEqual(
+                    refreshed["disks"]["S"]["observations"]["io"]["fresh"], fresh
+                )
             with self.assertRaises(ValueError):
                 state.with_freshness({"schema_version": 9})
 
@@ -441,11 +455,15 @@ class PublicationAndCLI(unittest.TestCase):
     def test_malformed_state_is_rejected_without_traceback(self):
         for document in (
             {"schema_version": True},
-            {"schema_version": 1},
-            {"schema_version": 1, "published_at": True, "disks": {}},
-            {"schema_version": 1, "published_at": 1, "disks": {"S": []}},
+            {"schema_version": state.SCHEMA_VERSION},
+            {"schema_version": state.SCHEMA_VERSION, "published_at": True, "disks": {}},
             {
-                "schema_version": 1,
+                "schema_version": state.SCHEMA_VERSION,
+                "published_at": 1,
+                "disks": {"S": []},
+            },
+            {
+                "schema_version": state.SCHEMA_VERSION,
                 "published_at": 1,
                 "disks": {
                     "S": {"serial": "S", "presence": "present", "observations": []}

@@ -7,7 +7,7 @@ import os
 import tempfile
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def publish(path, document):
@@ -41,6 +41,7 @@ def with_freshness(document, now=None):
         document.get("disks"), dict
     ):
         raise ValueError("invalid state document")
+    bays = set()
     for serial, row in document["disks"].items():
         if (
             not isinstance(row, dict)
@@ -48,6 +49,17 @@ def with_freshness(document, now=None):
             or row.get("presence") not in {"present", "missing", "ambiguous", "unknown"}
         ):
             raise ValueError("invalid disk row")
+        bay = row.get("bay")
+        active_at = row.get("last_active_at")
+        if (
+            bay is not None
+            and (type(bay) is not int or bay < 1 or bay in bays)
+            or active_at is not None
+            and not number(active_at)
+        ):
+            raise ValueError("invalid bay or activity timestamp")
+        if bay is not None:
+            bays.add(bay)
         observations = row.get("observations")
         if not isinstance(observations, dict) or set(observations) != {
             "io",
@@ -67,14 +79,11 @@ def with_freshness(document, now=None):
             if stamp is not None and not number(stamp):
                 raise ValueError("invalid observation timestamp")
     result = copy.deepcopy(document)
-    published = result["published_at"]
-    result["service_fresh"] = 0 <= now - published <= 5
     for row in result["disks"].values():
         for observation in row["observations"].values():
             stamp = observation["observed_at"]
             observation["fresh"] = bool(
-                result["service_fresh"]
-                and row["presence"] == "present"
+                row["presence"] == "present"
                 and stamp is not None
                 and observation.get("error") is None
                 and 0 <= now - stamp <= observation["max_age_seconds"]
