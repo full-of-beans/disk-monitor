@@ -94,6 +94,18 @@ appear as missing or unknown values. See the [schema and design](docs/design.md)
 for interpreting measurements and the [NAS integration notes](docs/nas-integration.md)
 for policy ownership.
 
+## Troubleshoot
+
+- If `discover` finds the expected serial with an unknown transport, check the
+  device's sysfs ancestry and cached udev `ID_ATA` property. Adding an alias can
+  resolve a verified identity, but cannot make a bridge eligible for SAT.
+- If temperature stays null while a drive is awake, check `smartctl --version`
+  and the service journal for the power-check or partial-data diagnostics.
+  A drive can supply self-test status while omitting SCT temperature.
+- If state stops advancing, check `systemctl status disk-monitor` and both
+  output directories. A held writer lock, read-only custom output path, or
+  snapshot write failure is reported in the journal.
+
 ## Development
 
 ```sh
