@@ -1,280 +1,199 @@
-"""Independent deadlines; one hardware probe per drive, I/O never waits for SMART."""
+"""One monotonic monitoring cycle and two atomic snapshot outputs."""
 
 import fcntl
+import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from queue import Empty, Full, Queue
+from contextlib import ExitStack
+from datetime import UTC, datetime
 
-from disk_monitor.discovery import discover, resolve, same_generation
-from disk_monitor.probes import io_counter, observe
-from disk_monitor.state import SCHEMA_VERSION, publish, with_freshness
+from disk_monitor.counters import metrics, sample
+from disk_monitor.discovery import discover, resolve, same_block_node, same_generation
+from disk_monitor.hooks import Hooks
+from disk_monitor.probes import Smart, observe
+from disk_monitor.state import SCHEMA_VERSION, encode, publish
 
-SOURCES = {
-    "io": "sysfs:stat:io_ticks",
-    "spindle": "hdparm:-C",
-    "temperature": "smartctl:scttempsts",
-    "self_test": "smartctl:capabilities",
-}
+LOG = logging.getLogger(__name__)
+SMART_WORKERS = 4
 
 
-def empty(interval, kind):
-    return ({"activity": "unknown"} if kind == "io" else {}) | {
-        "value": "unknown" if kind in ("spindle", "self_test") else None,
-        "attempted_at": None,
-        "observed_at": None,
-        "last_value": None,
-        "last_success_at": None,
-        "error": "not_observed",
-        "max_age_seconds": max(2 * interval, interval + 15),
-        "source": SOURCES[kind],
-    }
+def utc_timestamp():
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class Monitor:
     def __init__(
         self,
         config,
+        stop,
         *,
         discoverer=discover,
         probe=observe,
-        counter=io_counter,
-        clock=time.monotonic,
-        epoch=time.time,
+        counter=sample,
         validator=same_generation,
+        node_validator=same_block_node,
+        timestamp=utc_timestamp,
     ):
-        self.config, self.discoverer, self.probe, self.counter = (
-            config,
-            discoverer,
-            probe,
-            counter,
-        )
-        self.clock, self.epoch, self.validator = clock, epoch, validator
-        self.next_discovery = 0
-        self.dirty = True
-        # Consumers drain this bounded mailbox in their own worker. No callback
-        # or transport ever runs in the scheduler. Oldest events may be dropped.
-        self.completions = Queue(maxsize=32)
-        self.pool = ThreadPoolExecutor(max_workers=len(config.drives))
-        self.pending, self.devices, self.baselines = {}, {}, {}
-        self.due = {(d.serial, k): 0 for d in config.drives for k in config.intervals}
-        self.rows = {
-            d.serial: {
-                "serial": d.serial,
-                "bay": d.bay,
-                "presence": "unknown",
-                "last_active_at": None,
-                "device": None,
-                "presence_observed_at": None,
-                "observations": {k: empty(i, k) for k, i in config.intervals.items()},
-            }
-            for d in config.drives
-        }
+        self.config = config
+        self.stop = stop
+        self.discoverer = discoverer
+        self.probe = probe
+        self.counter = counter
+        self.validator = validator
+        self.node_validator = node_validator
+        self.timestamp = timestamp
+        self.devices = {}
+        self.baselines = {}
+        self.pool = ThreadPoolExecutor(max_workers=SMART_WORKERS)
+        self.hooks = Hooks(config.post_hooks)
 
     def inventory(self):
         try:
             return resolve(self.config.drives, self.discoverer())
-        except (OSError, UnicodeError):
-            return {d.serial: ("unknown", None) for d in self.config.drives}
+        except (OSError, UnicodeError) as error:
+            LOG.warning("disk discovery unavailable: %s", error)
+            return {drive.serial: ("unknown", None) for drive in self.config.drives}
 
-    def snapshot(self):
-        return with_freshness(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "published_at": self.epoch(),
-                "disks": self.rows,
-            },
-            self.epoch(),
-        )
+    def hardware(self, device):
+        if self.stop.is_set():
+            return Smart()
+        if not self.validator(device):
+            return Smart(error="identity_changed")
+        if not self.node_validator(device):
+            return Smart(error="SMART block node unavailable or mismatched")
+        result = self.probe(device)
+        if not self.validator(device):
+            return Smart(error="identity_changed")
+        if not self.node_validator(device):
+            return Smart(error="SMART block node changed during probe")
+        return result
 
-    def notify(self, serial, kind, stamp):
-        event = {
-            "serial": serial,
-            "kind": kind,
-            "completed_at": stamp,
-            "state": self.snapshot(),
-        }
-        try:
-            self.completions.put_nowait(event)
-        except Full:
-            try:
-                self.completions.get_nowait()
-            except Empty:
-                pass  # A consumer drained it concurrently.
-            self.completions.put_nowait(event)
-
-    def record(self, serial, kind, value, error, extra=None, stamp=None):
-        drive = self.rows[serial]
-        row = drive["observations"][kind]
-        now = self.epoch() if stamp is None else stamp
-        old_activity = row.get("activity", "unknown")
-        row.update(
-            value=("unknown" if kind in ("spindle", "self_test") and error else value),
-            attempted_at=now,
-            observed_at=now if error is None else None,
-            error=error,
-        )
-        if error is None:
-            row.update(last_value=value, last_success_at=now)
-        if kind == "spindle":
-            row["raw_state"] = (extra or {}).get("raw_state")
-        if kind == "io":
-            row["window_seconds"] = (extra or {}).get("window_seconds")
-            row["activity"] = (
-                "unknown" if error else "busy" if (extra or {}).get("busy") else "idle"
-            )
-            self.dirty |= row["activity"] != old_activity
-        else:
-            # Every completed hardware attempt is meaningful, including failures.
-            self.dirty = True
-        active = error is None and (
-            kind == "spindle"
-            and value == "active"
-            and (extra or {}).get("raw_state")
-            in {"active/idle", "active", "idle", "idle_a", "idle_b", "idle_c"}
-            or kind == "io"
-            and row["activity"] == "busy"
-            or kind in ("temperature", "self_test")
-            and (extra or {}).get("confirms_active") is True
-        )
-        if active:
-            prior = drive["last_active_at"]
-            drive["last_active_at"] = max(prior, now) if prior is not None else now
-        self.notify(serial, kind, now)
-
-    def hardware(self, serial, device, kind):
-        # Full metadata validation is deliberately retained at hardware boundaries.
-        # It also detects duplicate identity claims that a diskseq check cannot.
-        if self.inventory().get(serial) != ("present", device):
-            return None, "identity_changed", {}, self.epoch()
-        value, error, extra = self.probe(kind, device)
-        stamp = self.epoch()
-        if self.inventory().get(serial) != ("present", device):
-            return None, "identity_changed", {}, stamp
-        return value, error, extra, stamp
-
-    def reconcile(self, inventory):
-        for serial, (presence, device) in inventory.items():
-            row = self.rows[serial]
-            if device != self.devices.get(serial) or presence != row["presence"]:
-                row["observations"] = {
-                    k: empty(i, k) for k, i in self.config.intervals.items()
-                }
-                self.baselines.pop(serial, None)
-                for kind in self.config.intervals:
-                    self.due[serial, kind] = 0
-                self.dirty = True
-            self.devices[serial] = device
-            row.update(
-                presence=presence,
-                device=device.path if device else None,
-                presence_observed_at=self.epoch(),
-                device_generation=list(device.generation) if device else None,
-            )
-
-    def tick(self):
-        if self.clock() >= self.next_discovery:
-            self.reconcile(self.inventory())
-            self.next_discovery = self.clock() + self.config.discovery_interval
-        completed = [
-            (serial, task) for serial, task in self.pending.items() if task[0].done()
-        ]
-        if completed:
-            # Validate against live metadata, not the periodic inventory cache.
-            self.reconcile(self.inventory())
-        for serial, (future, device, kind) in completed:
-            value, error, extra, stamp = future.result()
-            if self.devices.get(serial) == device:
-                if error == "identity_changed":
-                    self.reconcile({serial: ("unknown", None)})
-                    self.next_discovery = 0
-                else:
-                    self.record(serial, kind, value, error, extra, stamp)
-                    self.due[serial, kind] = self.clock() + self.config.intervals[kind]
-            del self.pending[serial]
-        for serial, device in list(self.devices.items()):
-            if device is None:
+    def cycle(self):
+        self.devices = self.inventory()
+        samples, rates, targets = {}, {}, {}
+        for serial, (presence, device) in self.devices.items():
+            if self.stop.is_set():
+                return
+            if presence != "present":
                 continue
-            now = self.clock()
-            if now >= self.due[serial, "io"]:
-                # Guard both sides: a reused sdX must never contribute counters
-                # to this serial's baseline or last_active_at.
+            if not self.validator(device):
+                self.devices[serial] = ("unknown", None)
+                continue
+            try:
+                current = self.counter(device)
                 if not self.validator(device):
-                    self.reconcile({serial: ("unknown", None)})
-                    self.next_discovery = 0
+                    self.devices[serial] = ("unknown", None)
                     continue
-                try:
-                    ticks, counters = self.counter(device)
-                    if not self.validator(device):
-                        self.reconcile({serial: ("unknown", None)})
-                        self.next_discovery = 0
-                        continue
-                    prior = self.baselines.get(serial)
-                    value, error, busy = None, "baseline_required", False
-                    if (
-                        prior
-                        and 0 < now - prior[0] <= 2 * self.config.intervals["io"]
-                        and ticks >= prior[1]
-                        and len(counters) == len(prior[2])
-                        and all(a >= b for a, b in zip(counters, prior[2]))
-                    ):
-                        value = min(100.0, (ticks - prior[1]) / ((now - prior[0]) * 10))
-                        busy = ticks > prior[1] or counters != prior[2]
-                        error = None
-                    self.baselines[serial] = (now, ticks, counters)
-                    self.record(
-                        serial,
-                        "io",
-                        value,
-                        error,
-                        {
-                            "window_seconds": now - prior[0] if error is None else None,
-                            "busy": busy,
-                        },
-                    )
-                except (OSError, ValueError, UnicodeError):
-                    self.baselines.pop(serial, None)
-                    self.record(serial, "io", None, "counters_unavailable")
-                self.due[serial, "io"] = now + self.config.intervals["io"]
-            # Oldest due hardware observation wins; no overlapping commands on a drive.
-            if serial not in self.pending:
-                kinds = [
-                    k
-                    for k in self.config.intervals
-                    if k != "io" and now >= self.due[serial, k]
-                ]
-                if kinds:
-                    kind = min(kinds, key=lambda k: self.due[serial, k])
-                    self.pending[serial] = (
-                        self.pool.submit(self.hardware, serial, device, kind),
-                        device,
-                        kind,
-                    )
-        return self.snapshot()
+                samples[serial] = current
+                rates[serial] = metrics(self.baselines.get(serial), current)
+            except (OSError, ValueError) as error:
+                LOG.warning("%s: kernel counters unavailable: %s", serial, error)
+            targets[serial] = device
 
-    def publish_changes(self):
-        if self.dirty:
-            publish(self.config.output, self.snapshot())
-            self.dirty = False
+        smart = dict(zip(targets, self.pool.map(self.hardware, targets.values())))
+        if self.stop.is_set():
+            return
+        # Recheck claims after all workers finish, including new duplicate identities.
+        if targets:
+            confirmed = self.inventory()
+            for serial, device in targets.items():
+                if (
+                    confirmed[serial] != ("present", device)
+                    or smart[serial].error == "identity_changed"
+                ):
+                    presence, _ = confirmed[serial]
+                    self.devices[serial] = (
+                        "unknown" if presence == "present" else presence,
+                        None,
+                    )
+                    samples.pop(serial, None)
+                    smart.pop(serial)
+                    LOG.warning("%s: identity changed during monitoring", serial)
+
+        disks, raw = {}, {}
+        for serial, (presence, device) in self.devices.items():
+            observation = smart.get(serial, Smart())
+            if observation.error:
+                LOG.warning("%s: %s", serial, observation.error)
+            elif presence == "unknown" and device:
+                LOG.warning(
+                    "%s: supported ATA SMART transport could not be established", serial
+                )
+            elif presence == "ambiguous":
+                LOG.warning("%s: multiple identity claims", serial)
+            current = samples.get(serial)
+            disks[serial] = {
+                "device": device.path if device else None,
+                "presence": presence,
+                "spindle": observation.spindle,
+                "temperature_c": observation.temperature_c,
+                "self_test": observation.self_test,
+                "io": rates[serial] if current is not None else metrics(None, None),
+            }
+            if current is not None:
+                raw[serial] = {
+                    "device": device.path,
+                    "diskseq": current.generation.diskseq,
+                    "major_minor": current.generation.major_minor,
+                    "sysfs_path": current.generation.sysfs_path,
+                    "sysfs_inode": current.generation.sysfs_inode,
+                    "sample_monotonic_ns": current.monotonic_ns,
+                    "counters": current.counters,
+                }
+        self.baselines = samples
+        stamp = self.timestamp()
+        payload = encode(
+            {"schema_version": SCHEMA_VERSION, "observed_at": stamp, "disks": disks}
+        )
+        try:
+            publish(self.config.counters, encode({"updated_at": stamp, "disks": raw}))
+            publish(self.config.output, payload)
+        except OSError as error:
+            LOG.error("snapshot publication failed: %s", error)
+        else:
+            if not self.stop.is_set():
+                self.hooks.dispatch(payload)
 
     def close(self):
+        self.hooks.close()
         self.pool.shutdown(wait=True, cancel_futures=True)
 
 
+def schedule(cycle, interval, stop, clock=time.monotonic_ns):
+    period = round(interval * 1_000_000_000)
+    deadline = clock()
+    while not stop.is_set():
+        cycle()
+        deadline += period
+        now = clock()
+        if now > deadline:
+            missed = (now - deadline + period - 1) // period
+            deadline += missed * period
+            LOG.warning("monitor cycle overran, skipping %d scheduled start(s)", missed)
+        stop.wait(max(0, deadline - now) / 1_000_000_000)
+
+
 def serve(config, stop):
-    # Lifetime lock covers foreground and systemd executions using this output.
-    config.output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        str(config.output) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
-    )
-    with os.fdopen(descriptor, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        monitor = Monitor(config)
+    # Lock both names: different configurations may share either output.
+    paths = {
+        path.parent.resolve() / path.name for path in (config.output, config.counters)
+    }
+    if len(paths) != 2:
+        raise ValueError("output paths refer to the same file")
+    with ExitStack() as stack:
+        for path in sorted(paths):
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            descriptor = os.open(
+                str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+            )
+            lock = stack.enter_context(os.fdopen(descriptor, "r+"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise OSError(f"another disk-monitor writer owns {path}") from error
+        monitor = Monitor(config, stop)
         try:
-            while not stop.is_set():
-                monitor.tick()
-                monitor.publish_changes()
-                stop.wait(1)
+            schedule(monitor.cycle, config.interval, stop)
         finally:
             monitor.close()
-            # Readers expire each measurement; file age is not service health.

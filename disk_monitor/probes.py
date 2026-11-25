@@ -1,9 +1,20 @@
-"""Read-only bounded hardware probes and pure conservative parsers."""
+"""Consolidated, power-gated ATA SMART observations."""
 
 import json
 import re
 import subprocess
-from pathlib import Path
+from dataclasses import dataclass
+
+SMART_TIMEOUT = 3
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+@dataclass(frozen=True)
+class Smart:
+    spindle: str = "unknown"
+    temperature_c: int | None = None
+    self_test: str = "unknown"
+    error: str | None = None
 
 
 def run(argv, timeout):
@@ -14,111 +25,119 @@ def run(argv, timeout):
         text=True,
         timeout=timeout,
         check=False,
-        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+        env=ENV,
     )
 
 
-def spindle(result):
-    matches = re.findall(
-        r"^[ \t]*drive state is:[ \t]*([a-z][a-z0-9 /_-]*)[ \t]*$",
-        result.stdout.lower(),
-        re.MULTILINE,
-    )
-    raw = (
-        " ".join(matches[0].split())
-        if result.returncode == 0 and len(matches) == 1
-        else None
-    )
-    return (
-        "unknown" if raw is None else "standby" if raw == "standby" else "active",
-        raw,
-    )
-
-
-def smart_document(result):
-    if result.returncode == 3:
-        raise ValueError("standby")
-    if result.returncode < 0 or result.returncode & 7:
-        raise ValueError("smart_command_failed")
-    document = json.loads(result.stdout)
-    if not isinstance(document, dict):
-        raise ValueError("invalid_smart_document")
-    return document
-
-
-def temperature(document):
-    obj = document.get("temperature")
-    value = obj.get("current") if isinstance(obj, dict) else None
-    if type(value) is not int or not -127 <= value <= 127:
-        raise ValueError("temperature_unavailable")
-    return value
-
-
-def self_test(document):
+def self_test(document, lines):
     try:
         code = document["ata_smart_data"]["self_test"]["status"]["value"]
     except (KeyError, TypeError):
-        raise ValueError("self_test_unavailable") from None
-    if (
-        type(code) is not int
-        or not 0 <= code <= 255
-        or code >> 4 not in (*range(9), 15)
+        return "unknown"
+    if type(code) is not int or not 0 <= code <= 255:
+        return "unknown"
+    if code >> 4 <= 8:
+        return "inactive"
+    if 0xF0 <= code <= 0xF9 and not any(
+        "unknown result or self-test" in s for s in lines
     ):
-        raise ValueError("self_test_unavailable")
-    return "active" if code >> 4 == 15 else "inactive"
+        return "active"
+    return "unknown"
 
 
-def io_counter(device, sys_block=Path("/sys/block")):
-    fields = tuple(
-        int(f) for f in (sys_block / device.name / "stat").read_text().split()
+def parse(result, device):
+    document = json.loads(result.stdout)
+    meta = document["smartctl"]
+    version = meta["version"]
+    rc = result.returncode
+    if (
+        not isinstance(version, list)
+        or len(version) < 2
+        or any(type(part) is not int for part in version)
+        or version[:2] < [7, 3]
+    ):
+        return Smart(error="requires smartmontools 7.3+")
+    if rc < 0 or type(meta["exit_status"]) is not int or meta["exit_status"] != rc:
+        return Smart(error="invalid SMART exit status")
+    lines = meta.get("output", [])
+    messages = [entry["string"] for entry in meta.get("messages", [])]
+    diagnostics = {*messages, *lines}
+    if any("CHECK POWER MODE" in line for line in diagnostics):
+        return Smart(error="unsupported or unknown ATA power check")
+    if rc == 3 and diagnostics & {
+        "Device is in STANDBY mode, exit(3)",
+        "Device is in STANDBY_Y mode, exit(3)",
+    }:
+        return Smart(spindle="standby")
+    if rc == 3 and any(
+        re.fullmatch(r"Device is in (?:IDLE(?:_[ABC])?|SLEEP) mode, exit\(3\)", line)
+        for line in diagnostics
+    ):
+        # A failed ATA check can also be reported by smartctl as SLEEP.
+        return Smart(error="idle cutoff or unconfirmed sleep")
+    if rc & 3:
+        return Smart(error=f"SMART open, identification or command-line error ({rc})")
+
+    serial = document.get("serial_number")
+    if serial is not None and (
+        not isinstance(serial, str)
+        or (
+            serial != device.ata_serial
+            if device.ata_serial
+            else serial not in device.identities
+        )
+    ):
+        return Smart(error="identity_changed")
+
+    mode = document.get("power_mode", {})
+    active = isinstance(mode, dict) and mode.get("name") in {
+        "ACTIVE or IDLE",
+        "ACTIVE_NV_UP",
+    }
+    active = active or any(
+        re.fullmatch(r"Power mode (?:is|was):\s+ACTIVE(?: or IDLE|_NV_UP)", line)
+        for line in lines
     )
-    if len(fields) < 11 or any(f < 0 for f in fields):
-        raise ValueError("invalid_io_counters")
-    # Keep request/sector counters too: short real I/O may add no io_ticks.
-    return fields[9], fields[:8] + fields[11:15]
+    if not active:
+        return Smart(error="ATA active power state unconfirmed")
+    temperature = document.get("ata_sct_status", {})
+    temperature = (
+        temperature.get("temperature", {}) if isinstance(temperature, dict) else {}
+    )
+    temperature = temperature.get("current") if isinstance(temperature, dict) else None
+    if type(temperature) is not int or not -127 <= temperature <= 127:
+        temperature = None
+    test = self_test(document, lines)
+    error = None
+    if temperature is None or test == "unknown" or rc & 4:
+        error = f"partial SMART data (exit {rc})"
+    return Smart("active", temperature, test, error)
 
 
-def observe(kind, device, runner=run):
+def observe(device, runner=run):
+    if device.transport not in {"ata", "sat"}:
+        return Smart(error="unsupported SMART transport")
     try:
-        if kind == "spindle":
-            value, raw = spindle(runner(["hdparm", "-C", device.path], 10))
-            return (
-                value,
-                None if raw is not None else "power_unavailable",
-                {"raw_state": raw},
-            )
-        args = ["smartctl", "-d", "sat", "-n", "standby,3,5"]
-        args += (
-            ["-l", "scttempsts", "--json"]
-            if kind == "temperature"
-            else ["-c", "--json"]
+        result = runner(
+            [
+                "smartctl",
+                "-d",
+                device.transport,
+                "-n",
+                "idle,3,5",
+                "-i",
+                "-c",
+                "-l",
+                "scttempsts",
+                "--json=o",
+                device.path,
+            ],
+            SMART_TIMEOUT,
         )
-        doc = smart_document(runner(args + [device.path], 3))
-        # If firmware supplies identity despite the narrow query, reject a
-        # contradiction rather than accepting telemetry for another drive.
-        if "serial_number" in doc and doc["serial_number"] not in device.identities:
-            return None, "identity_changed", {}
-        # No -i: activity is read from capabilities, not a historical test log.
-        value = temperature(doc) if kind == "temperature" else self_test(doc)
-        # Current running-test status is activity evidence; a temperature or
-        # historical/inactive test value alone may be cached and is not.
-        return (
-            value,
-            None,
-            {"confirms_active": kind == "self_test" and value == "active"},
-        )
-    except ValueError as error:
-        reason = str(error)
-        if reason not in {
-            "standby",
-            "smart_command_failed",
-            "invalid_smart_document",
-            "temperature_unavailable",
-            "self_test_unavailable",
-        }:
-            reason = "invalid_response"
-        return None, reason, {}
+        return parse(result, device)
     except subprocess.TimeoutExpired:
-        return None, "timeout", {}
-    except (OSError, subprocess.SubprocessError, TypeError, UnicodeError):
-        return None, "probe_unavailable", {}
+        return Smart(error="SMART timed out")
+    except (OSError, subprocess.SubprocessError) as error:
+        return Smart(error=f"SMART execution failed: {error}")
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return Smart(error="invalid SMART JSON")

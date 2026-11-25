@@ -1,27 +1,33 @@
-"""Strict TOML configuration; identity is explicit, never a guessed sdX path."""
+"""Strict TOML configuration for explicitly enrolled HDDs."""
 
-import math
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULTS = {"io": 10, "spindle": 30, "temperature": 60, "self_test": 60}
+RUNTIME = Path("/run/disk-monitor")
 
 
 @dataclass(frozen=True)
 class Drive:
     serial: str
-    bay: int | None = None
     identity_aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Hook:
+    name: str
+    command: tuple[str, ...]
+    timeout: float = 5
 
 
 @dataclass(frozen=True)
 class Config:
     drives: tuple[Drive, ...]
-    intervals: dict
-    output: Path = Path("/run/disk-monitor/state.json")
-    discovery_interval: float = 60
+    interval: float = 60
+    output: Path = RUNTIME / "state.json"
+    counters: Path = RUNTIME / "counters.json"
+    post_hooks: tuple[Hook, ...] = ()
 
 
 def keys(value, allowed):
@@ -30,65 +36,90 @@ def keys(value, allowed):
 
 
 def identity(value):
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ValueError("identity must be a nonempty, trimmed string")
-    if len(value) > 256 or any(ord(c) < 32 for c in value):
-        raise ValueError("invalid identity")
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(c) < 32 or ord(c) == 127 for c in value)
+    ):
+        raise ValueError("identity must be a nonempty, trimmed string without controls")
     return value
+
+
+def seconds(value, name, minimum, maximum):
+    if type(value) not in (int, float) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be {minimum}..{maximum} seconds")
+    return value
+
+
+def output_path(value, name):
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"/[A-Za-z0-9_./-]+", value)
+        or value.startswith("//")
+        or value.endswith("/")
+        or ".." in Path(value).parts
+        or Path(value) == Path("/")
+    ):
+        raise ValueError(f"output.{name} must be an absolute file path")
+    return Path(value)
 
 
 def load(path):
     with Path(path).open("rb") as stream:
         data = tomllib.load(stream)
-    keys(data, ("drives", "intervals", "output", "discovery_interval"))
-    intervals = dict(DEFAULTS)
-    supplied = data.get("intervals", {})
-    keys(supplied, DEFAULTS)
-    for name, value in supplied.items():
-        if (
-            type(value) not in (int, float)
-            or not math.isfinite(value)
-            or not 1 <= value <= 86400
-        ):
-            raise ValueError(f"{name} interval must be 1..86400 seconds")
-        intervals[name] = value
-    discovery_interval = data.get("discovery_interval", 60)
-    if (
-        type(discovery_interval) not in (int, float)
-        or not math.isfinite(discovery_interval)
-        or not 1 <= discovery_interval <= 86400
-    ):
-        raise ValueError("discovery_interval must be 1..86400 seconds")
+    keys(data, ("interval", "drives", "output", "post_hooks"))
+    interval = seconds(data.get("interval", 60), "interval", 1, 86400)
     rows = data.get("drives")
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 32:
-        raise ValueError("configure 1..32 drives")
-    drives, claims, bays = [], set(), set()
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("configure at least one drive serial")
+    drives, claims = [], set()
     for row in rows:
-        keys(row, ("serial", "bay", "identity_aliases"))
+        keys(row, ("serial", "identity_aliases"))
         serial = identity(row.get("serial"))
-        bay = row.get("bay")
-        if "bay" in row and (type(bay) is not int or bay < 1):
-            raise ValueError("bay must be a positive integer")
         aliases = row.get("identity_aliases", [])
         if not isinstance(aliases, list):
             raise ValueError("identity_aliases must be an array")
-        aliases = tuple(identity(a) for a in aliases)
-        if len(set((serial, *aliases))) != 1 + len(aliases) or claims.intersection(
-            (serial, *aliases)
-        ):
+        aliases = tuple(identity(alias) for alias in aliases)
+        identities = {serial, *aliases}
+        if len(identities) != 1 + len(aliases) or claims & identities:
             raise ValueError("duplicate drive identity or alias")
-        if bay is not None and bay in bays:
-            raise ValueError("duplicate bay")
-        claims.update((serial, *aliases))
-        bays.add(bay)
-        drives.append(Drive(serial, bay, aliases))
+        claims.update(identities)
+        drives.append(Drive(serial, aliases))
+
     output = data.get("output", {})
-    keys(output, ("path",))
-    path = output.get("path", "/run/disk-monitor/state.json")
+    keys(output, ("path", "counters_path"))
+    state = output_path(output.get("path", str(Config.output)), "path")
+    counters = output_path(
+        output.get("counters_path", str(Config.counters)), "counters_path"
+    )
     if (
-        not isinstance(path, str)
-        or not re.fullmatch(r"/[A-Za-z0-9_./-]+", path)
-        or ".." in Path(path).parts
+        state == counters
+        or state.name.endswith(".lock")
+        or counters.name.endswith(".lock")
     ):
-        raise ValueError("output.path must be an absolute safe path")
-    return Config(tuple(drives), intervals, Path(path), discovery_interval)
+        raise ValueError("output files must be distinct and cannot end in .lock")
+
+    hooks, names = [], set()
+    post_hooks = data.get("post_hooks", [])
+    if not isinstance(post_hooks, list):
+        raise ValueError("post_hooks must be an array of tables")
+    for row in post_hooks:
+        keys(row, ("name", "command", "timeout"))
+        name = row.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            raise ValueError("hook name must contain 1..64 letters, digits, _ or -")
+        if name in names:
+            raise ValueError(f"duplicate hook name: {name}")
+        names.add(name)
+        command = row.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(arg, str) or "\0" in arg for arg in command)
+            or not command[0].strip()
+        ):
+            raise ValueError(f"hook {name} command must be a nonempty argument array")
+        timeout = seconds(row.get("timeout", 5), f"hook {name} timeout", 0.1, 300)
+        hooks.append(Hook(name, tuple(command), timeout))
+    return Config(tuple(drives), interval, state, counters, tuple(hooks))

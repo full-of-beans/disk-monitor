@@ -1,35 +1,30 @@
 # disk-monitor
 
-A small Linux service that observes configured HDDs without intentionally waking
-or changing their power state. Python 3.11+ standard library only at runtime.
-No database, network listener, NAS dependency, or fan-control policy.
+Disk Monitor is a passive Linux service for explicitly enrolled rotational
+ATA/SATA HDDs. It resolves devices by serial, reads Linux block I/O counters,
+and uses one power-gated SMART command per eligible drive per cycle. The cycle
+runs immediately and repeats every 60 seconds by default.
 
-**Initial release scope:** whole `/dev/sd*` ATA/SATA HDDs, including SAT-capable
-USB bridges. NVMe, SAS, hardware RAID and bridges requiring proprietary SMART
-transports are unsupported. Missing metadata, unsupported commands and failures
-remain unknown; they never imply idle, standby, a completed test, or good health.
-This PR has software validation only. CENMATE commissioning is still required.
+- `/run/disk-monitor/state.json` contains current-cycle spindle state,
+  temperature, self-test activity and seven I/O metrics keyed by serial.
+- `/run/disk-monitor/counters.json` contains raw Linux counters, device
+  generation and actual sample times for diagnosis.
+- Optional post-hooks receive the published state JSON on stdin. Slow and
+  failed hooks are isolated from monitoring and each other.
 
-| Observation | Default interval | Method |
-| --- | --- | --- |
-| I/O busy percentage | 10 s | Delta of kernel `stat` I/O milliseconds over monotonic elapsed time |
-| Spindle | 30 s | `hdparm -C` (10 s timeout) |
-| Temperature, °C | 60 s | SAT `smartctl -n standby,3,5 -l scttempsts --json` (3 s timeout) |
-| Current SMART self-test activity | 60 s | SAT `smartctl -n standby,3,5 -c --json` (3 s timeout) |
-
-These are independent deadlines. Hardware commands serialize per drive; a slow
-SMART command cannot block I/O observation or another drive. No SMART identity
-probe, test start/abort, SMART enable, standby request, or fallback waking query
-is issued. Standby protection depends on the actual bridge/drive implementation;
-see the [hardware validation procedure](docs/validation.md).
+Supported hardware is native libata HDDs and ATA HDDs on USB-SATA bridges with
+safe SAT passthrough and cached udev ATA identification. NVMe, SSDs, native SAS,
+RAID volumes and proprietary bridge transports are outside the hardware scope.
+[Commission each drive and bridge](docs/validation.md) before unattended use.
+Disk Monitor never requests standby or starts or stops SMART tests.
 
 ## Install
 
-Debian example (requires an operator-approved installation window):
+Use Python 3.11+ and smartmontools 7.3+. On Debian-family systems with those
+versions available:
 
 ```sh
-sudo apt-get install python3 smartmontools hdparm
-# Review and check out the desired disk-monitor commit first.
+sudo apt-get install python3 smartmontools
 sudo sh ./install.sh
 sudo cp /etc/disk-monitor/example.toml /etc/disk-monitor/config.toml
 sudoedit /etc/disk-monitor/config.toml
@@ -38,115 +33,72 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now disk-monitor.service
 ```
 
-`install.sh` installs files only. It never starts a service or replaces
-`config.toml`. `DESTDIR=/temporary/root sh ./install.sh` stages the same layout
-for inspection. Updates use the same installer followed by an explicit restart;
-stop the service before replacing its Python files. Keep code, configuration,
-and the state directory root-owned and unwritable by other users. The service
-needs root for ATA ioctls and access to `/sys`, cached udev data, and disk nodes.
-The default `/run/disk-monitor` location is disposable tmpfs, preventing telemetry
-writes from creating monitored HDD activity. A custom output directory must also
-be on tmpfs and needs a matching systemd `ReadWritePaths` override.
+The installer copies program files, an example, and the unit. It preserves
+`config.toml` and leaves service activation to the operator. Use
+`DESTDIR=/temporary/root sh ./install.sh` for staging or
+`python -m pip install .` for the CLI without the systemd or config files.
+For an upgrade, stop the service before replacing its Python files, update
+its configuration for the current schema, and then start it again.
 
-Use smartmontools **7.3+** for the explicit unsupported-power-mode exit status;
-Linux must expose `/sys/block/sd*/diskseq` (Linux 5.15+). An older/unsupported
-installation fails conservatively; it is not a supported deployment target.
-The installer does not install Python development tools or Python packages.
+The unit uses root for ATA passthrough, a managed runtime directory, a
+read-only system filesystem, and access to real device nodes. Own program
+files, configuration, temporary directories used for output, and hook
+executables as root. Keep these paths unwritable by untrusted users. Hooks
+run with the service's privileges. Use a tmpfs for outputs and hook-side
+writes so polling does not generate I/O on the monitored storage. For custom
+output paths under systemd, explicitly grant the parent directories as
+writable via a unit override. Keep their lifetime and permissions under
+operator control.
 
-## Configure and run
+## Configure
 
-Start with [config/example.toml](config/example.toml). Configure each drive's
-actual serial and optional unique positive integer bay number (for example,
-`bay = 1` through `bay = 6`). Bays are configured slots, never `/dev/sdX` order.
-Omit bay for an unnumbered installation. Intervals accept finite numbers
-from 1 to 86400 seconds; omitted intervals use the defaults above. Unknown keys,
-duplicate identities/aliases, duplicate bay numbers and malformed values fail
-validation. `discovery_interval` defaults to 60 seconds and accepts the same
-range. Discovery runs at startup and reconciles periodically; command-boundary
-identity checks remain. Ordinary unplug/replug or enclosure power cycles recover
-automatically, normally within 60 seconds, with no service restart. Configuration
-is loaded once; restart after changing it.
+```toml
+interval = 60
 
-```sh
-# Source checkout or installed CLI; discovery reads cached metadata only.
-./disk-monitor discover
-./disk-monitor --config config/example.toml validate
-sudo disk-monitor --config /etc/disk-monitor/config.toml run
-# In another terminal; Ctrl-C / SIGTERM stops foreground execution.
-disk-monitor --config /etc/disk-monitor/config.toml status
+[[drives]]
+serial = "SERIAL_001"
+
+[[drives]]
+serial = "SERIAL_002"
+# identity_aliases = ["ata-MODEL_SERIAL_002"]
+
+# [output]
+# path = "/run/disk-monitor/state.json"
+# counters_path = "/run/disk-monitor/counters.json"
+
+# [[post_hooks]]
+# name = "example-consumer"
+# command = ["/usr/local/bin/example-consumer"]
+# timeout = 5
 ```
 
-`discover` works without a configuration. It lists kernel serial, cached udev
-serial variants and full by-id basenames as exact candidate identities; it does
-not certify which candidate belongs to a physical disk. Match against known
-physical serials. When a USB bridge exposes a different identifier, add only a
-**manually verified exact** `identity_aliases` entry. Never accept a shared
-bridge serial as a per-drive identity. Unresolved devices receive no commands;
-multiple matches, or two configured drives claiming one device, are ambiguous.
-An unexpected replacement serial stays missing rather than inheriting a bay.
+Only drive serials are required. Configure at least one exact ATA serial.
+Use aliases only after confirming that the cached identity or complete by-id
+basename denotes the intended physical HDD. A match shared by two devices
+or two configured entries is ambiguous. Set the interval to 1–86,400 seconds.
+Hook arguments are passed directly and the per-hook timeout defaults to 5
+seconds (allowed 0.1–300).
 
-`status` reads the JSON only, recalculates freshness and exits 1 for a missing,
-malformed or unsupported document. A valid snapshot exits 0 even if its
-observations are unknown or stale: inspect each observation and its timestamps.
-This command does not assert service liveness; use `systemctl is-active` for that.
-`validate` exits 0 for valid configuration and 1 on errors. Argument errors exit 2.
-Do not run foreground monitoring alongside the systemd service. A lifetime
-output-file lock rejects a second writer using the same path.
+```sh
+disk-monitor discover
+disk-monitor --config config/example.toml validate
+disk-monitor --config /etc/disk-monitor/config.toml status
+journalctl -u disk-monitor.service
+```
 
-## State and troubleshooting
-
-Default output: `/run/disk-monitor/state.json`, schema version 2. Atomic rename
-ensures readers see one complete document. Files are mode 0644; serials and bay
-numbers are visible to local users. There is no persistent telemetry history.
-Runtime state is authoritative in memory. Startup, presence/identity changes,
-completed hardware probes (including failures), and I/O busy/idle/unknown
-transitions publish snapshots; changes in one scheduler iteration coalesce.
-There is no heartbeat. Repeated I/O samples update memory without writes; other
-events include the latest I/O sample. An unchanged classification can therefore
-be stale in the file even while the monitor is running.
-
-Each observation has independent attempt/success timestamps, source, error,
-maximum age and freshness. Cached last successful temperatures are retained
-through a failed/standby probe, without being presented as a fresh measurement.
-Drive-level `last_active_at` retains the latest trustworthy spinning evidence
-through standby, idle and temporary absence for the same serial. It resets to
-null on service restart and never transfers to another serial in the same bay.
-It is not a spin-down timestamp. An internal bounded completion mailbox provides
-full snapshots for future consumers, including a temperature snapshot after every
-completed temperature attempt; no bridge transport is implemented. See the
-[schema and design](docs/design.md) for exact evidence and consumer rules.
-
-- `journalctl -u disk-monitor.service` reports fatal configuration/publication
-  failures; per-probe failures appear in JSON `error` fields.
-- `missing` / `ambiguous`: compare `discover` identities with the configured
-  serials/aliases and verify the mapping physically. Do not replace identity
-  with `/dev/sdX`, or use `smartctl -i` as a periodic workaround.
-- `unknown`: confirm sysfs/udev permissions and `diskseq` support. Failed
-  inventory enumeration does not prove absence.
-- `standby` temperature/self-test errors are expected for sleeping drives.
-  `smart_command_failed` can mean unsupported power checks or SAT transport;
-  there is intentionally no unprotected fallback.
-- `power_unavailable` / `timeout`: check permissions, bridge support and USB
-  transport logs. A successful literal `hdparm` state of `unknown` is classified
-  as `active`, matching NAS semantics; failed or malformed output is `unknown`.
-- `baseline_required` is expected on startup, reconnect, counter reset or a
-  polling gap. A 0% busy observation never authorizes standby.
-- Stale observations: check their individual timestamps, service state and output
-  permissions. Consumers must expire data themselves even if the file still says
-  `fresh: true`; file modification time does not indicate service liveness.
+`discover` reads cached Linux metadata only and reports candidates and their
+transport. `status` prints the last published processed JSON. Use the unit
+status, journal and top-level snapshot timestamp to diagnose stalled updates.
+Missing disks, disabled SMART by a bridge, and individual observation failures
+appear as missing or unknown values. See the [schema and design](docs/design.md)
+for interpreting measurements and the [NAS integration notes](docs/nas-integration.md)
+for policy ownership.
 
 ## Development
 
 ```sh
-python3 -m pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 ruff format --check .
 ruff check .
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
-
-CI runs those checks on Python 3.11 and 3.13, installs the Python package and
-validates the example. Tests include an isolated installed layout, real process
-timeout, foreground SIGTERM/restart, and injected hardware failures; no real disk
-commands are executed by tests. [Integration planning](docs/nas-integration.md)
-defines how NAS deployment can later own the configuration and install this exact
-service while retaining its own storage policy.

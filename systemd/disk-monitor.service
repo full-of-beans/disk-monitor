@@ -1,12 +1,10 @@
 [Unit]
-Description=Passive HDD activity and telemetry monitor
+Description=Passive HDD telemetry monitor
 After=systemd-udevd.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/disk-monitor --config /etc/disk-monitor/config.toml run
-# JSON is event-driven, not a heartbeat. Check unit health and expire each
-# measurement independently; never restart solely because file mtime is old.
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=15

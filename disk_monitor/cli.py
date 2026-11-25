@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import signal
 import sys
 import threading
@@ -10,7 +11,6 @@ from dataclasses import asdict
 from disk_monitor.config import load
 from disk_monitor.discovery import discover
 from disk_monitor.service import serve
-from disk_monitor.state import with_freshness
 
 
 def main(argv=None):
@@ -33,10 +33,11 @@ def main(argv=None):
             print("Configuration valid")
         elif args.command == "status":
             with config.output.open() as stream:
-                document = with_freshness(json.load(stream))
+                document = json.load(stream)
             print(json.dumps(document, indent=2))
             return 0
         else:
+            logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
             stop = threading.Event()
             for signum in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(signum, lambda *_: stop.set())
