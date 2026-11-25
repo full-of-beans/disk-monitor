@@ -49,22 +49,25 @@ intact. Continuous in-memory sampling proceeds on later cycles.
 The combined command is:
 
 ```sh
-smartctl -d <ata-or-sat> -n idle,3,5 -i -c -l scttempsts --json=o <device>
+smartctl -d <ata-or-sat> -n standby,3,5 -i -c -l scttempsts --json=o <device>
 ```
 
-The explicit transport avoids device-type autodetection. The `idle` threshold
-suppresses queries in standby/sleep and all explicitly reported idle
-submodes, including reduced-power Idle_C. The `-i` output supplies ATA
-identity and the power-mode line on smartmontools 7.3, which also provides
-the capability self-test value and SCT current temperature in JSON. It runs
-after the power check. `--json=o` retains the diagnostic text on older
-versions. There is no unprotected retry.
+The explicit transport avoids device-type autodetection. The `standby`
+threshold stops the query in standby and sleep. ATA Idle, Idle_A, Idle_B
+and Idle_C permit polling and count as `active` in telemetry. A poll can
+bring a drive out of reduced spindle speed in Idle_C. The `-i` output
+supplies ATA identity and the power-mode line after the power check.
+Smartmontools 7.3 provides the capability self-test value and SCT current
+temperature in JSON. `--json=o` retains the power-mode and diagnostic text.
+There is no unprotected retry.
 
 Exit 3 requires the explicit ATA standby diagnostic before it counts as
 standby. Smartctl can report sleep when a power check fails, so that
-diagnostic alone leaves power unknown. Exit 5 or other failures with a
-power-check diagnostic are unknown. Other exit codes are bitmasks. The
-parser rejects argument, open and identification errors and considers
+diagnostic alone leaves power unknown. The second custom status, 5, tells
+smartctl to stop if the power check is unsupported or returns an
+unrecognized value. Unsupported, unconfirmed and conflicting power
+evidence leaves SMART observations unknown. Other exit codes are bitmasks.
+The parser rejects argument, open and identification errors and considers
 independent structured observations even when another command fails. A
 capability value indicating an ongoing self-test reports `active`. A
 recognized completed/aborted status reports `inactive`. The self-test field
@@ -74,11 +77,10 @@ Smartctl ultimately relies on drive firmware and the USB bridge to implement
 ATA CHECK POWER MODE truthfully and without waking media. Some devices
 return an inaccurate active state, and power can change between the check
 and later commands. Smartctl also recognizes obsolete NV-cache states for
-which the idle threshold does not guarantee suppression. Keep hardware
+which the standby threshold does not guarantee suppression. Keep hardware
 with those behaviors out of the monitored inventory. Some HDDs omit SCT
-temperature, and the conservative idle cutoff may suppress valid readings
-on hardware that reports idle while still spinning. Verify both awake
-and asleep behavior during [commissioning](validation.md).
+temperature. Verify both polling while awake and no wake-up from standby
+during [commissioning](validation.md).
 
 References: [smartctl 7.3 manual](https://github.com/smartmontools/smartmontools/blob/RELEASE_7_3/smartmontools/smartctl.8.in)
 and [7.3 ATA JSON and power handling](https://github.com/smartmontools/smartmontools/blob/RELEASE_7_3/smartmontools/ataprint.cpp).
@@ -186,10 +188,13 @@ position, thermal load or NAS idle eligibility.
 
 Counter samples live in process memory. The first cycle after startup always
 reports null for all seven metrics. Missing or ambiguous identity, changed
-device generation, failed counter reads, a required cumulative counter
-decrease, and nonpositive elapsed time invalidate the comparison. A valid
-sample then forms a new baseline. The service never reads the raw snapshot
-back or changes the kernel counters.
+device generation, failed counter reads and nonpositive elapsed time
+invalidate the comparison. A decrease in any cumulative counter present in
+both samples also invalidates all seven metrics, including decreases in
+merge, weighted-I/O, discard or flush counters. The instantaneous
+`io_in_progress` gauge is excluded. A current valid sample is still
+published in the raw snapshot and forms the next baseline. The service
+never reads the raw snapshot back or changes the kernel counters.
 
 References: [Linux block stat field definitions](https://docs.kernel.org/block/stat.html)
 and [kernel I/O accounting](https://docs.kernel.org/admin-guide/iostats.html).

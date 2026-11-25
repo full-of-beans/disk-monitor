@@ -61,11 +61,17 @@ def metrics(previous, current):
     elapsed_ns = current.monotonic_ns - previous.monotonic_ns
     if elapsed_ns <= 0:
         return empty
+    if any(
+        field != "io_in_progress"
+        and field in previous.counters
+        and value < previous.counters[field]
+        for field, value in current.counters.items()
+    ):
+        return empty
     elapsed = elapsed_ns / 1_000_000_000
-    result = {}
-    for name, (field, scale) in METRICS.items():
-        delta = current.counters[field] - previous.counters[field]
-        if delta < 0:
-            return empty
-        result[name] = round(delta * scale / elapsed, 3)
-    return result
+    return {
+        name: round(
+            (current.counters[field] - previous.counters[field]) * scale / elapsed, 3
+        )
+        for name, (field, scale) in METRICS.items()
+    }

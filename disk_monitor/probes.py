@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 SMART_TIMEOUT = 3
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+ACTIVE_MODES = {"ACTIVE or IDLE", "ACTIVE_NV_UP", "IDLE", "IDLE_A", "IDLE_B", "IDLE_C"}
+STANDBY_MODES = {"STANDBY", "STANDBY_Y"}
 
 
 @dataclass(frozen=True)
@@ -64,17 +66,30 @@ def parse(result, device):
     diagnostics = {*messages, *lines}
     if any("CHECK POWER MODE" in line for line in diagnostics):
         return Smart(error="unsupported or unknown ATA power check")
-    if rc == 3 and diagnostics & {
-        "Device is in STANDBY mode, exit(3)",
-        "Device is in STANDBY_Y mode, exit(3)",
-    }:
-        return Smart(spindle="standby")
-    if rc == 3 and any(
-        re.fullmatch(r"Device is in (?:IDLE(?:_[ABC])?|SLEEP) mode, exit\(3\)", line)
+    reported = {
+        match[1]
         for line in diagnostics
-    ):
+        if (match := re.fullmatch(r"Power mode (?:is|was):\s+(.+)", line))
+    }
+    mode = document.get("power_mode", {})
+    if "power_mode" in document:
+        if not isinstance(mode, dict) or not isinstance(mode.get("name"), str):
+            return Smart(error="invalid ATA power-mode evidence")
+        reported.add(mode["name"])
+    cutoffs = {
+        match[1]
+        for line in diagnostics
+        if (match := re.fullmatch(r"Device is in (.+) mode, exit\(3\)", line))
+    }
+    if len(reported | cutoffs) > 1:
+        return Smart(error="conflicting ATA power-mode evidence")
+    if rc == 3 and cutoffs:
+        if cutoffs <= STANDBY_MODES:
+            return Smart(spindle="standby")
         # A failed ATA check can also be reported by smartctl as SLEEP.
-        return Smart(error="idle cutoff or unconfirmed sleep")
+        if "SLEEP" in cutoffs:
+            return Smart(error="sleep or failed ATA power check")
+        return Smart(error="unexpected ATA power-mode cutoff")
     if rc & 3:
         return Smart(error=f"SMART open, identification or command-line error ({rc})")
 
@@ -89,16 +104,7 @@ def parse(result, device):
     ):
         return Smart(error="identity_changed")
 
-    mode = document.get("power_mode", {})
-    active = isinstance(mode, dict) and mode.get("name") in {
-        "ACTIVE or IDLE",
-        "ACTIVE_NV_UP",
-    }
-    active = active or any(
-        re.fullmatch(r"Power mode (?:is|was):\s+ACTIVE(?: or IDLE|_NV_UP)", line)
-        for line in lines
-    )
-    if not active:
+    if cutoffs or not reported or not reported <= ACTIVE_MODES:
         return Smart(error="ATA active power state unconfirmed")
     temperature = document.get("ata_sct_status", {})
     temperature = (
@@ -124,7 +130,7 @@ def observe(device, runner=run):
                 "-d",
                 device.transport,
                 "-n",
-                "idle,3,5",
+                "standby,3,5",
                 "-i",
                 "-c",
                 "-l",

@@ -271,7 +271,7 @@ class SmartTests(unittest.TestCase):
                     "-d",
                     transport,
                     "-n",
-                    "idle,3,5",
+                    "standby,3,5",
                     "-i",
                     "-c",
                     "-l",
@@ -296,16 +296,49 @@ class SmartTests(unittest.TestCase):
             (5, "CHECK POWER MODE returned unknown value 0x06, exit(5)", "unknown"),
             (5, "Device is in STANDBY mode, exit(3)", "unknown"),
             (0, "CHECK POWER MODE not implemented, ignoring -n option", "unknown"),
+            (0, "Device is in STANDBY mode, exit(3)", "unknown"),
             (0, "Power mode was:   ACTIVE_NV_DOWN", "unknown"),
             (0, None, "unknown"),
         ):
             with self.subTest(rc=rc, line=line):
-                result = observe(
-                    device(), Mock(return_value=smart_result(rc, line, None, None))
-                )
+                runner = Mock(return_value=smart_result(rc, line))
+                result = observe(device(), runner)
+                runner.assert_called_once()
                 self.assertEqual(result.spindle, expected)
                 self.assertIsNone(result.temperature_c)
                 self.assertEqual(result.self_test, "unknown")
+
+    def test_idle_modes_allow_smart_data(self):
+        for mode, value in zip(
+            ("IDLE", "IDLE_A", "IDLE_B", "IDLE_C"), range(0x80, 0x84)
+        ):
+            for result in (
+                smart_result(power=f"Power mode was:   {mode}"),
+                smart_result(
+                    power=None, extra={"power_mode": {"name": mode, "ata_value": value}}
+                ),
+            ):
+                with self.subTest(mode=mode, output=result.stdout):
+                    self.assertEqual(
+                        observe(device(), Mock(return_value=result)),
+                        Smart("active", 34, "inactive"),
+                    )
+
+    def test_conflicting_power_evidence_leaves_smart_unknown(self):
+        for rc, power in (
+            (0, "Power mode was:   IDLE_C"),
+            (3, "Device is in STANDBY_Y mode, exit(3)"),
+        ):
+            with self.subTest(rc=rc):
+                result = smart_result(
+                    rc,
+                    power,
+                    extra={"power_mode": {"name": "STANDBY", "ata_value": 0}},
+                )
+                self.assertEqual(
+                    observe(device(), Mock(return_value=result)),
+                    Smart(error="conflicting ATA power-mode evidence"),
+                )
 
     def test_independent_smart_fields_and_high_exit_bits(self):
         for rc, temp, test_code, expected_temp, expected_test in (
@@ -365,6 +398,11 @@ class SmartTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "[]", ""),
             smart_result(extra={"smartctl": {"version": [7, 2], "exit_status": 0}}),
             smart_result(extra={"smartctl": {"version": [7, 3], "exit_status": 3}}),
+            smart_result(
+                5,
+                "CHECK POWER MODE returned unknown value 0x06, exit(5)",
+                extra={"power_mode": {"name": "IDLE_C", "ata_value": 0x83}},
+            ),
             smart_result(extra={"serial_number": "OTHER"}),
         ):
             with self.subTest(bad=bad):
@@ -448,6 +486,37 @@ class CounterTests(unittest.TestCase):
         ):
             self.assertEqual(metrics(before, after), dict.fromkeys(METRICS))
 
+    def test_each_cumulative_decrease_invalidates_all_metrics(self):
+        before = self.sample([10] * 17, 0)
+        for index, field in enumerate(FIELDS):
+            if field == "io_in_progress":
+                continue
+            with self.subTest(field=field):
+                values = [11] * 17
+                values[index] = 9
+                after = self.sample(values, 1_000_000_000)
+                self.assertEqual(metrics(before, after), dict.fromkeys(METRICS))
+
+    def test_gauge_decrease_and_absent_extensions_allow_rates(self):
+        values = [11] * 17
+        values[8] = 0
+        for before_count, after_count in ((17, 17), (11, 17), (17, 15), (15, 11)):
+            with self.subTest(layouts=(before_count, after_count)):
+                before = self.sample([10] * before_count, 0)
+                after = self.sample(values[:after_count], 1_000_000_000)
+                self.assertEqual(
+                    metrics(before, after),
+                    {
+                        "busy_percent": 0.1,
+                        "read_time_percent": 0.1,
+                        "write_time_percent": 0.1,
+                        "read_bytes_per_second": 512.0,
+                        "write_bytes_per_second": 512.0,
+                        "read_iops": 1.0,
+                        "write_iops": 1.0,
+                    },
+                )
+
 
 class CycleTests(unittest.TestCase):
     def setUp(self):
@@ -527,6 +596,53 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(state["disks"]["S"]["spindle"], "unknown")
         self.new_monitor().cycle()
         self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], dict.fromkeys(METRICS))
+
+    def test_raw_stat_publication_and_rebaseline_after_flush_counter_reset(self):
+        stat = self.root / "sda" / "stat"
+        stat.parent.mkdir()
+        ticks = iter((1_000_000_000, 2_000_000_000, 3_000_000_000))
+        monitor = self.new_monitor(
+            counter=lambda target: sample(target, self.root, lambda: next(ticks))
+        )
+
+        stat.write_text(" ".join(map(str, range(10, 27))))
+        monitor.cycle()
+        state, raw = self.outputs()
+        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(
+            raw["disks"]["S"]["counters"],
+            {
+                "reads_completed": 10,
+                "reads_merged": 11,
+                "sectors_read": 12,
+                "read_ms": 13,
+                "writes_completed": 14,
+                "writes_merged": 15,
+                "sectors_written": 16,
+                "write_ms": 17,
+                "io_in_progress": 18,
+                "io_ms": 19,
+                "weighted_io_ms": 20,
+                "discards_completed": 21,
+                "discards_merged": 22,
+                "sectors_discarded": 23,
+                "discard_ms": 24,
+                "flushes_completed": 25,
+                "flush_ms": 26,
+            },
+        )
+
+        stat.write_text(" ".join(map(str, [*range(11, 27), 1])))
+        monitor.cycle()
+        state, raw = self.outputs()
+        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(raw["disks"]["S"]["counters"]["flush_ms"], 1)
+
+        stat.write_text(" ".join(map(str, [*range(12, 28), 2])))
+        monitor.cycle()
+        state, raw = self.outputs()
+        self.assertEqual(state["disks"]["S"]["io"]["read_iops"], 1.0)
+        self.assertEqual(raw["disks"]["S"]["counters"]["flush_ms"], 2)
 
     def test_hotplug_and_path_reassignment(self):
         self.monitor.cycle()

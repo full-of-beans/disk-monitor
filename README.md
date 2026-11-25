@@ -16,6 +16,9 @@ Supported hardware is native libata HDDs and ATA HDDs on USB-SATA bridges with
 safe SAT passthrough and cached udev ATA identification. NVMe, SSDs, native SAS,
 RAID volumes and proprietary bridge transports are outside the hardware scope.
 [Commission each drive and bridge](docs/validation.md) before unattended use.
+The SMART power check permits polling in ATA idle modes, including Idle_C,
+where polling can raise the spindle from reduced speed. The query is gated
+at standby and sleep.
 Disk Monitor never requests standby or starts or stops SMART tests.
 
 ## Install
