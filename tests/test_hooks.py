@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from disk_monitor.config import Config, Drive, Hook
+from disk_monitor.counters import FIELDS, Sample
 from disk_monitor.discovery import Device, Generation
 from disk_monitor.hooks import Hooks
 from disk_monitor.probes import Smart
@@ -58,28 +59,34 @@ class HookTests(unittest.TestCase):
             ata_serial="S",
         )
 
-        def unavailable(_):
-            raise OSError("test counters unavailable")
-
+        stamps = iter((10_000_000_000, 12_000_000_000))
         monitor = Monitor(
             config,
             threading.Event(),
             discoverer=lambda: [disk],
             validator=lambda _: True,
             node_validator=lambda _: True,
-            counter=unavailable,
+            counter=lambda target: Sample(
+                target.generation, next(stamps), dict.fromkeys(FIELDS, 0)
+            ),
             probe=lambda _: Smart("standby"),
         )
         self.addCleanup(monitor.close)
-        monitor.cycle()
-        for future in monitor.hooks.pending.values():
-            future.result(timeout=3)
-        for path in paths:
-            document, argument = json.loads(path.read_text())
-            self.assertEqual(document, json.loads(state.read_text()))
-            self.assertEqual(document["disks"]["M"]["presence"], "missing")
-            self.assertEqual(document["disks"]["S"]["spindle"], "standby")
-            self.assertEqual(argument, literal)
+        for expected_idle in (None, 2):
+            monitor.cycle()
+            for future in monitor.hooks.pending.values():
+                future.result(timeout=3)
+            for path in paths:
+                document, argument = json.loads(path.read_text())
+                self.assertEqual(document, json.loads(state.read_text()))
+                self.assertEqual(document["schema_version"], 4)
+                self.assertEqual(document["disks"]["M"]["presence"], "missing")
+                self.assertIsNone(document["disks"]["M"]["io"]["idle_seconds"])
+                self.assertEqual(document["disks"]["S"]["spindle"], "standby")
+                self.assertEqual(
+                    document["disks"]["S"]["io"]["idle_seconds"], expected_idle
+                )
+                self.assertEqual(argument, literal)
         self.assertFalse((self.root / "unexpected").exists())
 
     def test_failures_and_timeout(self):

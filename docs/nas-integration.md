@@ -2,11 +2,12 @@
 
 A separately reviewed NAS integration can install Disk Monitor at a pinned
 commit and render its configuration from the authoritative NAS inventory.
-Disk Monitor publishes passive evidence. The NAS owns serial-to-role and
-slot mapping, idle accounting, storage-operation and lifecycle locks,
-maintenance scheduling, standby authorization and enclosure power control.
+Disk Monitor is the intended owner of periodic HDD I/O idle tracking.
+The NAS owns serial-to-role and slot mapping, storage-operation and
+lifecycle locks, maintenance scheduling, standby policy and authorization,
+and spindle and enclosure power control.
 
-Use schema 3 for passive consumers able to handle explicit missing or
+Use schema 4 for passive consumers able to handle explicit missing or
 unknown observations and age the entire snapshot. Direct fan-controller
 communication belongs in that project's host integration. A generic
 post-hook can deliver telemetry to an approved separate consumer.
@@ -19,17 +20,19 @@ post-hook can deliver telemetry to an approved separate consumer.
   `nas-hdd-status` and `nas_storage.observability`. Inventory all current
   readers and writers on the integration branch before switching. Keep
   Disk Monitor's outputs at separate paths during commissioning.
-- NAS readers can migrate to schema 3 or use an explicitly NAS-owned
-  projection. Preserve SSD telemetry and NAS-owned idle/power fields using
-  their existing sources. The snapshot completion time is not an exact
-  per-observation timestamp. A compatibility projection must preserve that
-  uncertainty and cannot refresh older samples using a new completion time.
-- Continue authoritative idle accounting through the NAS IdleTracker or a
-  deliberately reviewed equivalent. Three-decimal utilization and a
-  monitoring gap are insufficient evidence for idle authorization. Keep
-  immediate pre-action verification of device identity, I/O and firmware
-  self-test status under the NAS's existing locks. A cached standby or
-  inactive state never authorizes standby or enclosure power removal.
+- NAS readers can migrate to schema 4 or use a NAS-owned projection.
+  Keep SSD telemetry and NAS-owned policy fields on their existing sources.
+  The snapshot completion time represents the whole cycle. A projection
+  must preserve sampling uncertainty and the original observation age.
+- Plan to replace periodic NAS HDD idle observations with Disk Monitor's
+  `io.idle_seconds` after validating both during commissioning. Review
+  differences in availability, continuity and reporting cadence before
+  retiring the periodic HDD IdleTracker path. Treat null or stale idle
+  observations as unavailable evidence for standby decisions.
+- Keep immediate pre-actuation verification of current device identity,
+  I/O and firmware self-test status in nas-config under its existing locks.
+  Idle duration and other cached telemetry are inputs to policy. Standby
+  and enclosure power removal still require authorization in nas-config.
 - Review exclusion of monitoring during storage operations and enclosure
   transitions. Standalone deployment has no NAS lock coupling. The NAS may
   orchestrate stopping and starting the service across protected phases.

@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def encode(document):

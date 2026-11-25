@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import UTC, datetime
 
-from disk_monitor.counters import metrics, sample
+from disk_monitor.counters import measure_io, sample
 from disk_monitor.discovery import discover, resolve, same_block_node, same_generation
 from disk_monitor.hooks import Hooks
 from disk_monitor.probes import Smart, observe
@@ -45,6 +45,7 @@ class Monitor:
         self.timestamp = timestamp
         self.devices = {}
         self.baselines = {}
+        self.max_idle_gap_ns = int(2 * config.interval * 1_000_000_000)
         self.pool = ThreadPoolExecutor(max_workers=SMART_WORKERS)
         self.hooks = Hooks(config.post_hooks)
 
@@ -71,7 +72,7 @@ class Monitor:
 
     def cycle(self):
         self.devices = self.inventory()
-        samples, rates, targets = {}, {}, {}
+        samples, targets = {}, {}
         for serial, (presence, device) in self.devices.items():
             if self.stop.is_set():
                 return
@@ -86,7 +87,6 @@ class Monitor:
                     self.devices[serial] = ("unknown", None)
                     continue
                 samples[serial] = current
-                rates[serial] = metrics(self.baselines.get(serial), current)
             except (OSError, ValueError) as error:
                 LOG.warning("%s: kernel counters unavailable: %s", serial, error)
             targets[serial] = device
@@ -111,7 +111,7 @@ class Monitor:
                     smart.pop(serial)
                     LOG.warning("%s: identity changed during monitoring", serial)
 
-        disks, raw = {}, {}
+        disks, raw, baselines = {}, {}, {}
         for serial, (presence, device) in self.devices.items():
             observation = smart.get(serial, Smart())
             if observation.error:
@@ -123,15 +123,25 @@ class Monitor:
             elif presence == "ambiguous":
                 LOG.warning("%s: multiple identity claims", serial)
             current = samples.get(serial)
+            previous, previous_idle_ns, previous_ata_serial = self.baselines.get(
+                serial, (None, None, None)
+            )
+            rates, idle_ns = measure_io(
+                previous, current, previous_idle_ns, self.max_idle_gap_ns
+            )
+            if current is not None and device.ata_serial != previous_ata_serial:
+                idle_ns = None
+            idle_seconds = None if idle_ns is None else idle_ns // 1_000_000_000
             disks[serial] = {
                 "device": device.path if device else None,
                 "presence": presence,
                 "spindle": observation.spindle,
                 "temperature_c": observation.temperature_c,
                 "self_test": observation.self_test,
-                "io": rates[serial] if current is not None else metrics(None, None),
+                "io": {**rates, "idle_seconds": idle_seconds},
             }
             if current is not None:
+                baselines[serial] = current, idle_ns, device.ata_serial
                 raw[serial] = {
                     "device": device.path,
                     "diskseq": current.generation.diskseq,
@@ -141,7 +151,7 @@ class Monitor:
                     "sample_monotonic_ns": current.monotonic_ns,
                     "counters": current.counters,
                 }
-        self.baselines = samples
+        self.baselines = baselines
         stamp = self.timestamp()
         payload = encode(
             {"schema_version": SCHEMA_VERSION, "observed_at": stamp, "disks": disks}

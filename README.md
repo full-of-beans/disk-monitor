@@ -6,7 +6,8 @@ and uses one power-gated SMART command per eligible drive per cycle. The cycle
 runs immediately and repeats every 60 seconds by default.
 
 - `/run/disk-monitor/state.json` contains current-cycle spindle state,
-  temperature, self-test activity and seven I/O metrics keyed by serial.
+  temperature, self-test activity, seven I/O metrics and observed I/O idle
+  duration keyed by serial. The processed snapshot uses schema 4.
 - `/run/disk-monitor/counters.json` contains raw Linux counters, device
   generation and actual sample times for diagnosis.
 - Optional post-hooks receive the published state JSON on stdin. Slow and
@@ -20,6 +21,13 @@ The SMART power check permits polling in ATA idle modes, including Idle_C,
 where polling can raise the spindle from reduced speed. The query is gated
 at standby and sleep.
 Disk Monitor never requests standby or starts or stops SMART tests.
+
+`io.idle_seconds` counts whole seconds of observed block I/O inactivity.
+It starts at null, grows across continuous observations with no I/O
+activity, and resets to zero when the kernel statistics show activity.
+Idle duration is independent of spindle state and provides passive evidence
+for consumers that make their own policy decisions. See the
+[idle duration contract](docs/design.md#observed-io-idle-duration).
 
 ## Install
 

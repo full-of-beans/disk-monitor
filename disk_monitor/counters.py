@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from disk_monitor.discovery import SYS_BLOCK, Generation
 
+IN_PROGRESS = "io_in_progress"
 FIELDS = (
     "reads_completed",
     "reads_merged",
@@ -14,7 +15,7 @@ FIELDS = (
     "writes_merged",
     "sectors_written",
     "write_ms",
-    "io_in_progress",
+    IN_PROGRESS,
     "io_ms",
     "weighted_io_ms",
     "discards_completed",
@@ -54,24 +55,35 @@ def sample(device, sys_block=SYS_BLOCK, clock=time.monotonic_ns):
     return Sample(device.generation, stamp, dict(zip(FIELDS, map(int, fields))))
 
 
-def metrics(previous, current):
+def measure_io(previous, current, previous_idle_ns, max_idle_gap_ns):
+    """Return the seven interval metrics and the current idle duration in ns."""
     empty = dict.fromkeys(METRICS)
     if previous is None or current is None or current.generation != previous.generation:
-        return empty
+        return empty, None
     elapsed_ns = current.monotonic_ns - previous.monotonic_ns
     if elapsed_ns <= 0:
-        return empty
-    if any(
-        field != "io_in_progress"
-        and field in previous.counters
-        and value < previous.counters[field]
+        return empty, None
+    deltas = {
+        field: value - previous.counters[field]
         for field, value in current.counters.items()
-    ):
-        return empty
+        if field != IN_PROGRESS and field in previous.counters
+    }
+    if any(delta < 0 for delta in deltas.values()):
+        return empty, None
     elapsed = elapsed_ns / 1_000_000_000
-    return {
-        name: round(
-            (current.counters[field] - previous.counters[field]) * scale / elapsed, 3
-        )
+    rates = {
+        name: round(deltas[field] * scale / elapsed, 3)
         for name, (field, scale) in METRICS.items()
     }
+    if (
+        elapsed_ns > max_idle_gap_ns
+        or current.counters.keys() != previous.counters.keys()
+    ):
+        return rates, None
+    if (
+        previous.counters[IN_PROGRESS]
+        or current.counters[IN_PROGRESS]
+        or any(deltas.values())
+    ):
+        return rates, 0
+    return rates, (previous_idle_ns or 0) + elapsed_ns

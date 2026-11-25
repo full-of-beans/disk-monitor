@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from disk_monitor.cli import main
 from disk_monitor.config import Config, Drive, Hook, load
-from disk_monitor.counters import FIELDS, METRICS, metrics, sample
+from disk_monitor.counters import FIELDS, METRICS, Sample, measure_io, sample
 from disk_monitor.discovery import (
     Device,
     Generation,
@@ -22,6 +22,9 @@ from disk_monitor.discovery import (
 from disk_monitor.probes import Smart, observe
 from disk_monitor.service import Monitor, schedule, serve
 from disk_monitor.state import encode, publish
+
+SECOND_NS = 1_000_000_000
+UNAVAILABLE_IO = dict.fromkeys((*METRICS, "idle_seconds"))
 
 
 def device(serial="S", name="sda", seq=12, transport="sat", aliases=()):
@@ -431,6 +434,9 @@ class CounterTests(unittest.TestCase):
         self.stat.write_text(" ".join(map(str, fields)))
         return sample(device(seq=seq), self.root, lambda: stamp)
 
+    def rates(self, previous, current):
+        return measure_io(previous, current, None, 120 * SECOND_NS)[0]
+
     def test_documented_fields_and_bad_inputs(self):
         for count in (11, 15, 17, 18):
             raw = self.sample(range(count), 800)
@@ -449,7 +455,7 @@ class CounterTests(unittest.TestCase):
             [30, 12, 60, 3000, 46, 52, 80, 1502, 1, 900, 4000], 3_000_000_000
         )
         self.assertEqual(
-            metrics(before, after),
+            self.rates(before, after),
             {
                 "busy_percent": 40.0,
                 "read_time_percent": 150.0,
@@ -468,7 +474,7 @@ class CounterTests(unittest.TestCase):
                 [read, 0, read, read, write, 0, write, write, 0, read + write, 0],
                 1_000_000_000,
             )
-            result = metrics(before, after)
+            result = self.rates(before, after)
             self.assertEqual(result["read_iops"], read)
             self.assertEqual(result["write_iops"], write)
             self.assertEqual(result["busy_percent"], (read + write) / 10)
@@ -484,7 +490,7 @@ class CounterTests(unittest.TestCase):
             self.sample([2**32 - 1] * 11, 1),
             self.sample([2**32 - 1] * 11, 200, seq=13),
         ):
-            self.assertEqual(metrics(before, after), dict.fromkeys(METRICS))
+            self.assertEqual(self.rates(before, after), dict.fromkeys(METRICS))
 
     def test_each_cumulative_decrease_invalidates_all_metrics(self):
         before = self.sample([10] * 17, 0)
@@ -495,7 +501,7 @@ class CounterTests(unittest.TestCase):
                 values = [11] * 17
                 values[index] = 9
                 after = self.sample(values, 1_000_000_000)
-                self.assertEqual(metrics(before, after), dict.fromkeys(METRICS))
+                self.assertEqual(self.rates(before, after), dict.fromkeys(METRICS))
 
     def test_gauge_decrease_and_absent_extensions_allow_rates(self):
         values = [11] * 17
@@ -505,7 +511,7 @@ class CounterTests(unittest.TestCase):
                 before = self.sample([10] * before_count, 0)
                 after = self.sample(values[:after_count], 1_000_000_000)
                 self.assertEqual(
-                    metrics(before, after),
+                    self.rates(before, after),
                     {
                         "busy_percent": 0.1,
                         "read_time_percent": 0.1,
@@ -517,11 +523,39 @@ class CounterTests(unittest.TestCase):
                     },
                 )
 
+    def test_every_cumulative_increase_counts_as_activity(self):
+        for count in (11, 15, 17):
+            before = self.sample([0] * count, 0)
+            unchanged = self.sample([0] * count, SECOND_NS)
+            self.assertEqual(
+                measure_io(before, unchanged, None, 2 * SECOND_NS)[1], SECOND_NS
+            )
+            for index, field in enumerate(FIELDS[:count]):
+                if field == "io_in_progress":
+                    continue
+                with self.subTest(count=count, field=field):
+                    values = [0] * count
+                    values[index] = 1
+                    after = self.sample(values, SECOND_NS)
+                    self.assertEqual(
+                        measure_io(before, after, 5 * SECOND_NS, 2 * SECOND_NS)[1], 0
+                    )
+
+    def test_outstanding_io_at_either_endpoint_prevents_idle_credit(self):
+        previous = self.sample([0] * 17, 0)
+        idle_ns = 5 * SECOND_NS
+        for step, gauge in enumerate((1, 2, 1, 0, 0), start=1):
+            values = [0] * 17
+            values[FIELDS.index("io_in_progress")] = gauge
+            current = self.sample(values, step * SECOND_NS)
+            rates, idle_ns = measure_io(previous, current, idle_ns, 2 * SECOND_NS)
+            self.assertEqual(rates, dict.fromkeys(METRICS, 0.0))
+            self.assertEqual(idle_ns, SECOND_NS if step == 5 else 0)
+            previous = current
+
 
 class CycleTests(unittest.TestCase):
     def setUp(self):
-        from disk_monitor.counters import Sample
-
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -569,8 +603,8 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(list(state), ["disks", "observed_at", "schema_version"])
         self.assertEqual(state["observed_at"], raw["updated_at"])
         self.assertEqual(state["observed_at"], self.stamp)
-        self.assertEqual(state["schema_version"], 3)
-        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["disks"]["S"]["io"], UNAVAILABLE_IO)
         self.assertEqual(
             state["disks"]["M"],
             {
@@ -579,7 +613,7 @@ class CycleTests(unittest.TestCase):
                 "spindle": "unknown",
                 "temperature_c": None,
                 "self_test": "unknown",
-                "io": dict.fromkeys(METRICS),
+                "io": UNAVAILABLE_IO,
             },
         )
         self.assertEqual(list(raw["disks"]), ["S"])
@@ -595,7 +629,130 @@ class CycleTests(unittest.TestCase):
         self.assertIsNone(state["disks"]["S"]["temperature_c"])
         self.assertEqual(state["disks"]["S"]["spindle"], "unknown")
         self.new_monitor().cycle()
-        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], UNAVAILABLE_IO)
+
+    def test_irregular_idle_intervals_accumulate_per_disk_independently_of_smart(self):
+        self.live[:] = [device(), device("M", "sdb")]
+        stamp = 0
+        counts = {"S": 0, "M": 0}
+        counter = Mock(
+            side_effect=lambda target: Sample(
+                target.generation,
+                stamp,
+                dict.fromkeys(FIELDS, 0)
+                | {"flushes_completed": counts[target.ata_serial]},
+            )
+        )
+        monitor = self.new_monitor(counter=counter)
+        for stamp, smart, flushes, expected in (
+            (0, Smart("active", 34), 0, (None, None)),
+            (1_600_000_000, Smart("standby"), 0, (1, 1)),
+            (2_200_000_000, Smart(), 1, (2, 0)),
+            (5_900_000_000, Smart(error="SMART timed out"), 1, (5, 3)),
+        ):
+            with self.subTest(stamp=stamp):
+                self.probe.return_value = smart
+                counts["M"] = flushes
+                monitor.cycle()
+                disks = self.outputs()[0]["disks"]
+                self.assertEqual(
+                    tuple(disks[serial]["io"]["idle_seconds"] for serial in ("S", "M")),
+                    expected,
+                )
+                self.assertEqual(disks["S"]["spindle"], smart.spindle)
+                self.assertEqual(disks["S"]["temperature_c"], smart.temperature_c)
+        self.assertEqual(counter.call_count, 8)
+        self.assertEqual(self.probe.call_count, 8)
+        stamp += 2 * SECOND_NS
+        self.new_monitor(counter=counter).cycle()
+        for disk in self.outputs()[0]["disks"].values():
+            self.assertEqual(disk["io"], UNAVAILABLE_IO)
+
+    def test_idle_rebaselines_after_invalid_comparisons(self):
+        self.config = replace(self.config, interval=2.5)
+        full = dict.fromkeys(FIELDS, 0) | {"flush_ms": 10}
+        for label, stamp, fields, rate in (
+            ("equal time", 5 * SECOND_NS, full, None),
+            ("backward time", 4 * SECOND_NS, full, None),
+            ("excessive gap", 10 * SECOND_NS + 1, full, 0.0),
+            ("field removal", 6 * SECOND_NS, dict.fromkeys(FIELDS[:15], 0), 0.0),
+            ("counter reset", 6 * SECOND_NS, full | {"flush_ms": 0}, None),
+        ):
+            with self.subTest(label=label):
+                generation = self.live[0].generation
+                counter = Mock(
+                    side_effect=[
+                        Sample(generation, 0, full),
+                        Sample(generation, 5 * SECOND_NS, full),
+                        Sample(generation, stamp, fields),
+                        Sample(generation, stamp + 2 * SECOND_NS, fields),
+                    ]
+                )
+                monitor = self.new_monitor(counter=counter)
+                for expected_idle, expected_rate in (
+                    (None, None),
+                    (5, 0.0),
+                    (None, rate),
+                    (2, 0.0),
+                ):
+                    monitor.cycle()
+                    io = self.outputs()[0]["disks"]["S"]["io"]
+                    self.assertEqual(io["idle_seconds"], expected_idle)
+                    self.assertEqual(io["busy_percent"], expected_rate)
+
+    def test_presence_and_counter_read_failures_discard_idle_history(self):
+        original = device()
+        replacement = device(seq=13)
+        stamp = 0
+
+        def read(target):
+            return Sample(target.generation, stamp, dict.fromkeys(FIELDS, 0))
+
+        counter = Mock(side_effect=read)
+        monitor = self.new_monitor(counter=counter)
+        for devices, failed, presence, expected in (
+            ([original], False, "present", None),
+            ([original], False, "present", 2),
+            ([], False, "missing", None),
+            ([original], False, "present", None),
+            ([original], False, "present", 2),
+            ([replacement], False, "present", None),
+            ([replacement], False, "present", 2),
+            ([replacement, device(name="sdc")], False, "ambiguous", None),
+            ([replacement], False, "present", None),
+            ([replacement], False, "present", 2),
+            ([replacement], True, "present", None),
+            ([replacement], False, "present", None),
+            ([replacement], False, "present", 2),
+        ):
+            stamp += 2 * SECOND_NS
+            with self.subTest(stamp=stamp, presence=presence, failed=failed):
+                self.live[:] = devices
+                counter.side_effect = OSError("read failed") if failed else read
+                monitor.cycle()
+                state, raw = self.outputs()
+                disk = state["disks"]["S"]
+                self.assertEqual(disk["presence"], presence)
+                self.assertEqual(disk["io"]["idle_seconds"], expected)
+                self.assertEqual(
+                    "S" in raw["disks"], presence == "present" and not failed
+                )
+
+    def test_ata_identity_change_behind_alias_restarts_idle_history(self):
+        self.config = replace(self.config, drives=(Drive("S", ("alias",)),))
+        stamps = iter(range(0, 8 * SECOND_NS, 2 * SECOND_NS))
+        monitor = self.new_monitor(
+            counter=lambda target: Sample(
+                target.generation, next(stamps), dict.fromkeys(FIELDS, 0)
+            )
+        )
+        for serial, expected in (("S", None), ("S", 2), ("OTHER", None), ("OTHER", 2)):
+            with self.subTest(serial=serial, expected=expected):
+                self.live[:] = [device(serial, aliases=("alias",))]
+                monitor.cycle()
+                row = self.outputs()[0]["disks"]["S"]
+                self.assertEqual(row["presence"], "present")
+                self.assertEqual(row["io"]["idle_seconds"], expected)
 
     def test_raw_stat_publication_and_rebaseline_after_flush_counter_reset(self):
         stat = self.root / "sda" / "stat"
@@ -608,7 +765,7 @@ class CycleTests(unittest.TestCase):
         stat.write_text(" ".join(map(str, range(10, 27))))
         monitor.cycle()
         state, raw = self.outputs()
-        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(state["disks"]["S"]["io"], UNAVAILABLE_IO)
         self.assertEqual(
             raw["disks"]["S"]["counters"],
             {
@@ -635,7 +792,7 @@ class CycleTests(unittest.TestCase):
         stat.write_text(" ".join(map(str, [*range(11, 27), 1])))
         monitor.cycle()
         state, raw = self.outputs()
-        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(state["disks"]["S"]["io"], UNAVAILABLE_IO)
         self.assertEqual(raw["disks"]["S"]["counters"]["flush_ms"], 1)
 
         stat.write_text(" ".join(map(str, [*range(12, 28), 2])))
@@ -655,12 +812,12 @@ class CycleTests(unittest.TestCase):
         self.monitor.cycle()
         state, _ = self.outputs()
         self.assertEqual(state["disks"]["S"]["device"], "/dev/sdc")
-        self.assertEqual(state["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(state["disks"]["S"]["io"], UNAVAILABLE_IO)
         self.monitor.cycle()
         self.assertEqual(self.outputs()[0]["disks"]["S"]["io"]["read_iops"], 1)
         self.live[0] = device(name="sdc", seq=14)
         self.monitor.cycle()
-        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], UNAVAILABLE_IO)
 
     def test_discovery_failure_and_counter_failure_reset_baselines(self):
         find = Mock(
@@ -677,7 +834,7 @@ class CycleTests(unittest.TestCase):
         monitor.cycle()
         self.assertEqual(self.outputs()[0]["disks"]["S"]["presence"], "unknown")
         monitor.cycle()
-        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], UNAVAILABLE_IO)
 
         counter = Mock(
             side_effect=[
@@ -694,7 +851,7 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(state["disks"]["S"]["temperature_c"], 34)
         self.assertFalse(raw["disks"])
         monitor.cycle()
-        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], dict.fromkeys(METRICS))
+        self.assertEqual(self.outputs()[0]["disks"]["S"]["io"], UNAVAILABLE_IO)
         monitor.cycle()
         self.assertEqual(self.outputs()[0]["disks"]["S"]["io"]["read_iops"], 1)
 
@@ -845,7 +1002,7 @@ class SchedulerTests(unittest.TestCase):
             output = Path(directory) / "state.json"
             config.write_text(f'[[drives]]\nserial="S"\n[output]\npath="{output}"\n')
             snapshot = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "observed_at": "2026-11-25T15:00:00Z",
                 "disks": {},
             }

@@ -89,7 +89,7 @@ and [7.3 ATA JSON and power handling](https://github.com/smartmontools/smartmont
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "observed_at": "2026-11-25T15:00:00.000000Z",
   "disks": {
     "SERIAL_001": {
@@ -99,13 +99,14 @@ and [7.3 ATA JSON and power handling](https://github.com/smartmontools/smartmont
       "temperature_c": 34,
       "self_test": "inactive",
       "io": {
-        "busy_percent": 42.5,
-        "read_time_percent": 30.2,
-        "write_time_percent": 18.7,
-        "read_bytes_per_second": 12500000.0,
-        "write_bytes_per_second": 4500000.0,
-        "read_iops": 85.2,
-        "write_iops": 32.1
+        "idle_seconds": 1860,
+        "busy_percent": 0.0,
+        "read_time_percent": 0.0,
+        "write_time_percent": 0.0,
+        "read_bytes_per_second": 0.0,
+        "write_bytes_per_second": 0.0,
+        "read_iops": 0.0,
+        "write_iops": 0.0
       }
     }
   }
@@ -122,6 +123,10 @@ temperature. Usable I/O remains available after a SMART timeout. The
 completion time describes snapshot publication readiness. Counter reads
 and firmware observations within the cycle can be separated by seconds.
 Consumers should impose a snapshot age appropriate to their own use.
+
+Schema 4 adds `io.idle_seconds` to each disk, including missing disks.
+The seven rate and utilization fields use the same calculations as schema 3.
+Post-hooks receive the schema 4 snapshot.
 
 ## Raw counter snapshot
 
@@ -199,6 +204,40 @@ never reads the raw snapshot back or changes the kernel counters.
 References: [Linux block stat field definitions](https://docs.kernel.org/block/stat.html)
 and [kernel I/O accounting](https://docs.kernel.org/admin-guide/iostats.html).
 
+## Observed I/O idle duration
+
+`io.idle_seconds` measures the contiguous duration for which consecutive
+kernel samples show no block I/O activity. It is a nonnegative integer
+rounded down from actual elapsed monotonic time. The monitor retains
+fractional seconds in memory. Each configured disk has its own history.
+
+Any increase in a cumulative counter, including discard, flush, merge
+and weighted-I/O statistics when available, is evidence of activity. A
+nonzero `io_in_progress` at either end of the interval also indicates
+activity, even when the gauge was higher at the preceding sample. On
+activity, idle duration resets to zero at the current sample. Credit
+starts at that sample only if a later comparison establishes an idle
+interval. This avoids estimating when an I/O within the interval ended.
+
+The first sample reports null. A restart, missing or ambiguous disk,
+changed ATA serial or device generation, failed counter read, decreased cumulative
+counter, changed set of available fields, nonpositive elapsed time, or
+sample gap longer than twice the configured interval breaks continuity.
+Idle duration is null at the break. The next valid sample, including the
+current sample when it is valid, becomes the new baseline. Idle history
+is never loaded from a previous snapshot. A changed field set or long
+gap can leave the seven rate and utilization fields available while idle
+duration is null.
+
+Idle duration is limited to activity visible in the available Linux
+block statistics and to identity changes the host can observe. A drive may stay
+spinning, carry out firmware work, or run a SMART self-test throughout
+an observed idle interval. Standby, unknown spindle state, unavailable
+temperature and SMART read failures do not interrupt valid kernel
+observations. An identity verification failure still invalidates the
+sample. Use idle duration as passive evidence. Standby authorization
+requires a separate policy and current checks.
+
 ## Post-hooks
 
 After both files publish successfully, each idle hook receives the exact
@@ -221,5 +260,5 @@ import json
 import sys
 
 snapshot = json.load(sys.stdin)
-raise SystemExit(0 if snapshot.get("schema_version") == 3 else 1)
+raise SystemExit(0 if snapshot.get("schema_version") == 4 else 1)
 ```
