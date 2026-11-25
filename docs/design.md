@@ -44,6 +44,30 @@ publication or following a processed-file write failure. A failed write is
 logged, suppresses hook dispatch for that cycle, and leaves its previous file
 intact. Continuous in-memory sampling proceeds on later cycles.
 
+## On-demand refresh
+
+`SIGUSR1` wakes the running scheduler. The main process runs the same
+complete cycle for every start, with the same in-memory counter baselines,
+idle duration, SMART guard, publication order, and post-hook dispatch.
+Signal delivery is asynchronous and provides no per-request acknowledgment
+or completion result.
+
+- A refresh received while the scheduler is waiting normally starts a
+  cycle promptly. If the next periodic deadline is due or within 100 ms,
+  that regular cycle satisfies the request at its normal start.
+- All requests pending when the scheduler takes a batch are coalesced.
+  Requests arriving after that point, including during the cycle, are
+  eligible for one follow-up cycle under the same deadline rule.
+- Periodic deadlines stay anchored to the original monotonic schedule.
+  After either kind of cycle, periodic deadlines strictly earlier than
+  cycle completion are skipped. Cycles never overlap.
+- `SIGINT` and `SIGTERM` wake the scheduler and take priority over pending
+  refreshes. Existing shutdown handling covers in-flight work.
+
+A refresh requested by a post-cycle hook can cause another delivery to
+that hook. Request a refresh only for a new condition that needs it, and
+ensure the hook can recognize the same condition on subsequent deliveries.
+
 ## Standby-protected SMART
 
 The combined command is:

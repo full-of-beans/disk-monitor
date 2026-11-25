@@ -1,6 +1,10 @@
 import io
 import json
+import os
+import select
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -20,7 +24,7 @@ from disk_monitor.discovery import (
     same_generation,
 )
 from disk_monitor.probes import Smart, observe
-from disk_monitor.service import Monitor, schedule, serve
+from disk_monitor.service import CycleRequests, Monitor, schedule, serve
 from disk_monitor.state import encode, publish
 
 SECOND_NS = 1_000_000_000
@@ -916,6 +920,51 @@ class CycleTests(unittest.TestCase):
         writer.assert_called_once()
         dispatch.assert_not_called()
 
+    def test_refresh_cycles_share_baselines_and_publish_the_hook_snapshot(self):
+        requests = CycleRequests()
+        self.addCleanup(requests.close)
+        now = 0
+        expected = iter(
+            ((0, None, None), (10, 10, 0.0), (35, 0, 1024.0), (60, 25, 0.0))
+        )
+
+        def counter(target):
+            values = dict.fromkeys(FIELDS, 0)
+            values["sectors_read"] = 50 if now >= 35 * SECOND_NS else 0
+            return Sample(target.generation, now, values)
+
+        monitor = self.new_monitor(counter=counter)
+        monitor.hooks.dispatch = Mock()
+
+        def wait(_):
+            nonlocal now
+            now = next(wakeups) * SECOND_NS
+            if now < 60 * SECOND_NS:
+                os.write(requests.signal_fd, bytes((signal.SIGUSR1,)))
+
+        def cycle():
+            monitor.cycle()
+            stamp, idle, throughput = next(expected)
+            state, raw = self.outputs()
+            self.assertEqual(now, stamp * SECOND_NS)
+            self.assertEqual(raw["disks"]["S"]["sample_monotonic_ns"], now)
+            self.assertEqual(raw["updated_at"], state["observed_at"])
+            self.assertEqual(state["disks"]["S"]["io"]["idle_seconds"], idle)
+            self.assertEqual(
+                state["disks"]["S"]["io"]["read_bytes_per_second"], throughput
+            )
+            monitor.hooks.dispatch.assert_called_once_with(
+                self.config.output.read_bytes()
+            )
+            monitor.hooks.dispatch.reset_mock()
+            if stamp == 60:
+                requests.request_stop()
+
+        wakeups = iter((10, 35, 60))
+        with patch.object(requests, "wait", side_effect=wait):
+            schedule(cycle, 60, requests, clock=lambda: now)
+        self.assertEqual(list(expected), [])
+
     def test_four_concurrent_probes_and_per_drive_isolation(self):
         self.live[:] = [device(str(i), f"sd{chr(97 + i)}") for i in range(7)]
         self.config = replace(
@@ -975,26 +1024,182 @@ class CycleTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_immediate_monotonic_start_and_skipped_overrun_slots(self):
-        stop = Mock()
-        stop.is_set.side_effect = [False, False, False, True]
-        clock = Mock(
-            side_effect=[
-                0,
-                0,
-                0,
-                60_000_000_000,
-                185_000_000_000,
-                240_000_000_000,
-                242_000_000_000,
-            ]
-        )
+    def setUp(self):
+        self.requests = CycleRequests()
+        self.addCleanup(self.requests.close)
+        self.now = 0
+
+    def refresh(self):
+        os.write(self.requests.signal_fd, bytes((signal.SIGUSR1,)))
+
+    def starts(self, count, *, wakeups=(), work=None):
+        events = iter(wakeups)
+        event = next(events, None)
         starts = []
-        schedule(lambda: starts.append(clock()), 60, stop, clock=clock)
-        self.assertEqual(starts, [0, 60_000_000_000, 240_000_000_000])
+
+        def wait(timeout_ns):
+            nonlocal event
+            if self.requests.poller.poll(0):
+                return
+            deadline = self.now + timeout_ns
+            if event is not None and event[0] <= deadline:
+                stamp, action = event
+                self.now = max(self.now, stamp)
+                action()
+                event = next(events, None)
+            else:
+                self.now = deadline
+
+        def cycle():
+            starts.append(self.now)
+            if work is not None:
+                work(len(starts))
+            if len(starts) == count:
+                self.requests.request_stop()
+
+        with patch.object(self.requests, "wait", side_effect=wait):
+            schedule(cycle, 60, self.requests, clock=lambda: self.now)
+        return starts
+
+    def test_immediate_monotonic_start_and_skipped_overrun_slots(self):
+        def work(index):
+            if index == 2:
+                self.now = 185 * SECOND_NS
+
+        with self.assertLogs("disk_monitor.service", level="WARNING") as logs:
+            self.assertEqual(
+                self.starts(4, work=work),
+                [0, 60 * SECOND_NS, 240 * SECOND_NS, 300 * SECOND_NS],
+            )
+        self.assertIn("skipping 2 scheduled start(s)", logs.output[0])
+
+    def test_periodic_cadence_and_refresh_while_waiting(self):
         self.assertEqual(
-            [call.args[0] for call in stop.wait.call_args_list], [60, 55, 58]
+            self.starts(4, wakeups=((10 * SECOND_NS, self.refresh),)),
+            [0, 10 * SECOND_NS, 60 * SECOND_NS, 120 * SECOND_NS],
         )
+
+    def test_requests_during_cycle_coalesce_into_one_follow_up(self):
+        def work(index):
+            if index == 1:
+                self.refresh()
+                self.refresh()
+                self.now += 3 * SECOND_NS
+
+        self.assertEqual(self.starts(3, work=work), [0, 3 * SECOND_NS, 60 * SECOND_NS])
+
+    def test_imminent_and_due_periodic_cycles_satisfy_pending_requests(self):
+        self.assertEqual(
+            self.starts(
+                4,
+                wakeups=(
+                    (60 * SECOND_NS - 50_000_000, self.refresh),
+                    (120 * SECOND_NS, self.refresh),
+                ),
+            ),
+            [0, 60 * SECOND_NS, 120 * SECOND_NS, 180 * SECOND_NS],
+        )
+
+    def test_refresh_overrun_skips_crossed_slot_without_shifting_cadence(self):
+        def work(index):
+            if index == 2:
+                self.now = 70 * SECOND_NS
+
+        with self.assertLogs("disk_monitor.service", level="WARNING") as logs:
+            self.assertEqual(
+                self.starts(
+                    4,
+                    wakeups=((40 * SECOND_NS, self.refresh),),
+                    work=work,
+                ),
+                [0, 40 * SECOND_NS, 120 * SECOND_NS, 180 * SECOND_NS],
+            )
+        self.assertIn("skipping 1 scheduled start(s)", logs.output[0])
+
+    def test_request_arriving_after_drain_is_retained(self):
+        take = self.requests.take_refresh
+        injected = False
+
+        def take_and_request():
+            nonlocal injected
+            pending = take()
+            if not injected and self.now == 60 * SECOND_NS:
+                injected = True
+                self.refresh()
+            return pending
+
+        with patch.object(self.requests, "take_refresh", side_effect=take_and_request):
+            self.assertEqual(self.starts(3), [0, 60 * SECOND_NS, 60 * SECOND_NS])
+
+    def stop_with_refresh(self):
+        self.refresh()
+        self.requests.request_stop()
+
+    def test_stop_wins_when_refresh_is_pending_during_wait(self):
+        self.assertEqual(
+            self.starts(2, wakeups=((SECOND_NS, self.stop_with_refresh),)), [0]
+        )
+
+    def test_stop_wins_when_refresh_is_pending_during_cycle(self):
+        self.assertEqual(self.starts(2, work=lambda _: self.stop_with_refresh()), [0])
+
+    def test_cli_signal_wakes_scheduler_across_poll_boundary(self):
+        script = """
+import signal
+import sys
+import threading
+from unittest.mock import patch
+from disk_monitor.cli import main
+from disk_monitor.service import schedule
+
+def serve(config, requests):
+    wait = requests.wait
+    first_wait = True
+    def signal_worker():
+        if sys.stdin.buffer.readline():
+            signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+    threading.Thread(target=signal_worker, daemon=True).start()
+    def wait_at_boundary(timeout_ns):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            signal.raise_signal(signal.SIGUSR1)
+        else:
+            print("waiting", flush=True)
+        wait(timeout_ns)
+    requests.wait = wait_at_boundary
+    schedule(lambda: print("cycle", flush=True), config.interval, requests)
+
+with patch("disk_monitor.cli.serve", side_effect=serve):
+    raise SystemExit(main(["--config", "config/example.toml", "run"]))
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            bufsize=0,
+        ) as process:
+            try:
+
+                def expect(line):
+                    self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+                    self.assertEqual(process.stdout.readline(), line)
+
+                expect(b"cycle\n")
+                expect(b"cycle\n")
+                expect(b"waiting\n")
+                process.send_signal(signal.SIGUSR1)
+                expect(b"cycle\n")
+                expect(b"waiting\n")
+                process.stdin.write(b"signal worker\n")
+                expect(b"cycle\n")
+                expect(b"waiting\n")
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertEqual(process.stdout.read(), b"")
+            finally:
+                if process.poll() is None:
+                    process.kill()
 
     def test_status_prints_published_document_without_probes(self):
         with tempfile.TemporaryDirectory() as directory:

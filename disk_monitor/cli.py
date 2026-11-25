@@ -5,12 +5,12 @@ import json
 import logging
 import signal
 import sys
-import threading
+from contextlib import ExitStack
 from dataclasses import asdict
 
 from disk_monitor.config import load
 from disk_monitor.discovery import discover
-from disk_monitor.service import serve
+from disk_monitor.service import CycleRequests, serve
 
 
 def main(argv=None):
@@ -38,10 +38,23 @@ def main(argv=None):
             return 0
         else:
             logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-            stop = threading.Event()
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(signum, lambda *_: stop.set())
-            serve(config, stop)
+            with ExitStack() as stack:
+                requests = CycleRequests()
+                stack.callback(requests.close)
+                for signum, handler in (
+                    (signal.SIGUSR1, lambda *_: None),
+                    (signal.SIGINT, requests.request_stop),
+                    (signal.SIGTERM, requests.request_stop),
+                ):
+                    previous = signal.signal(signum, handler)
+                    stack.callback(signal.signal, signum, previous)
+                # The low-level handler wakes poll even if a worker receives the signal.
+                # A full pipe already marks work pending. The stop handler also sets a flag.
+                previous_fd = signal.set_wakeup_fd(
+                    requests.signal_fd, warn_on_full_buffer=False
+                )
+                stack.callback(signal.set_wakeup_fd, previous_fd)
+                serve(config, requests)
         return 0
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"disk-monitor: {error}", file=sys.stderr)

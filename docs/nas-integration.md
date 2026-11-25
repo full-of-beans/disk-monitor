@@ -33,6 +33,13 @@ post-hook can deliver telemetry to an approved separate consumer.
   I/O and firmware self-test status in nas-config under its existing locks.
   Idle duration and other cached telemetry are inputs to policy. Standby
   and enclosure power removal still require authorization in nas-config.
+- After a verified external state transition, the NAS can request a full
+  refresh with `systemctl kill --kill-whom=main --signal=SIGUSR1 disk-monitor.service`.
+  Signal delivery only requests a cycle. The snapshot already in flight
+  may contain observations from before the transition. Use fresh telemetry
+  with the expected identity and observed state before surfacing the
+  transition through the NAS API. Keep refresh requests conditional if a
+  consumer can receive the resulting snapshot through a post-hook.
 - Review exclusion of monitoring during storage operations and enclosure
   transitions. Standalone deployment has no NAS lock coupling. The NAS may
   orchestrate stopping and starting the service across protected phases.

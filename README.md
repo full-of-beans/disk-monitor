@@ -105,6 +105,23 @@ appear as missing or unknown values. See the [schema and design](docs/design.md)
 for interpreting measurements and the [NAS integration notes](docs/nas-integration.md)
 for policy ownership.
 
+## Request a refresh
+
+Once the running service has published its first snapshot, request an
+additional monitoring cycle with:
+
+```sh
+systemctl kill --kill-whom=main --signal=SIGUSR1 disk-monitor.service
+```
+
+Use `--kill-who=main` on older systemctl versions that use that spelling.
+The command sends a signal to the main process and returns asynchronously.
+Refreshes use the same snapshots and hooks as regular cycles. Pending
+requests coalesce, and an imminent regular cycle can satisfy them. Check
+the published telemetry for the observation you need. If a post-cycle hook
+requests refreshes, make its request conditional to prevent a feedback loop.
+See the [scheduling rules](docs/design.md#on-demand-refresh).
+
 ## Troubleshoot
 
 - If `discover` finds the expected serial with an unknown transport, check the

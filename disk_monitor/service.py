@@ -3,6 +3,8 @@
 import fcntl
 import logging
 import os
+import select
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -16,6 +18,7 @@ from disk_monitor.state import SCHEMA_VERSION, encode, publish
 
 LOG = logging.getLogger(__name__)
 SMART_WORKERS = 4
+REFRESH_COALESCE_NS = 100_000_000
 
 
 def utc_timestamp():
@@ -170,21 +173,64 @@ class Monitor:
         self.pool.shutdown(wait=True, cancel_futures=True)
 
 
-def schedule(cycle, interval, stop, clock=time.monotonic_ns):
+class CycleRequests:
+    """Read process signals from the nonblocking pipe registered by the CLI."""
+
+    def __init__(self):
+        self.stopping = False
+        self.poller = select.poll()
+        self.read_fd, self.signal_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.capacity = fcntl.fcntl(self.read_fd, fcntl.F_GETPIPE_SZ)
+        self.poller.register(self.read_fd, select.POLLIN)
+
+    def request_stop(self, *_):
+        self.stopping = True
+
+    def is_set(self):
+        return self.stopping
+
+    def wait(self, timeout_ns):
+        self.poller.poll((timeout_ns + 999_999) // 1_000_000)
+
+    def take_refresh(self):
+        try:
+            received = os.read(self.read_fd, self.capacity)
+        except BlockingIOError:
+            return False
+        if signal.SIGINT in received or signal.SIGTERM in received:
+            self.stopping = True
+        return signal.SIGUSR1 in received
+
+    def close(self):
+        os.close(self.signal_fd)
+        os.close(self.read_fd)
+
+
+def schedule(cycle, interval, requests, clock=time.monotonic_ns):
     period = round(interval * 1_000_000_000)
     deadline = clock()
-    while not stop.is_set():
+    while not requests.is_set():
+        remaining = deadline - clock()
+        if remaining > 0:
+            requests.wait(remaining)
+        refresh = requests.take_refresh()
+        remaining = deadline - clock()
+        periodic = remaining <= 0
+        if not periodic and (not refresh or remaining <= REFRESH_COALESCE_NS):
+            continue
+        if requests.is_set():
+            return
         cycle()
-        deadline += period
+        if periodic:
+            deadline += period
         now = clock()
         if now > deadline:
             missed = (now - deadline + period - 1) // period
             deadline += missed * period
             LOG.warning("monitor cycle overran, skipping %d scheduled start(s)", missed)
-        stop.wait(max(0, deadline - now) / 1_000_000_000)
 
 
-def serve(config, stop):
+def serve(config, requests):
     # Lock both names: different configurations may share either output.
     paths = {
         path.parent.resolve() / path.name for path in (config.output, config.counters)
@@ -202,8 +248,8 @@ def serve(config, stop):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise OSError(f"another disk-monitor writer owns {path}") from error
-        monitor = Monitor(config, stop)
+        monitor = Monitor(config, requests)
         try:
-            schedule(monitor.cycle, config.interval, stop)
+            schedule(monitor.cycle, config.interval, requests)
         finally:
             monitor.close()
