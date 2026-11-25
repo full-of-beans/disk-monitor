@@ -1,0 +1,18 @@
+# Use the ATA serials shown by the metadata-only discover command.
+interval = 60
+
+[[drives]]
+serial = "SERIAL_001"
+
+[[drives]]
+serial = "SERIAL_002"
+# identity_aliases = ["ata-MODEL_SERIAL_002"]
+
+# [output]
+# path = "/run/disk-monitor/state.json"
+# counters_path = "/run/disk-monitor/counters.json"
+
+# [[post_hooks]]
+# name = "example-consumer"
+# command = ["/usr/local/bin/example-consumer"]
+# timeout = 5

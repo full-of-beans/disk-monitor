@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+"""Run from the source checkout or the fixed installed library directory."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from disk_monitor.cli import main  # noqa: E402
+
+raise SystemExit(main())
